@@ -153,6 +153,7 @@ function textSheet(title, text) {
 const viewHistory = ["view-library"];
 let viewHistoryIndex = 0;
 let pendingBackTarget = null;
+let captureReturnView = null;
 history.replaceState({ appView: "view-library", appIndex: 0 }, "");
 
 function activateView(viewId) {
@@ -172,7 +173,8 @@ function show(viewId) {
 }
 
 function backTo(viewId) {
-  if (viewHistory.lastIndexOf(viewId, viewHistoryIndex) < 0) {
+  const targetIndex = viewHistory.lastIndexOf(viewId, viewHistoryIndex - 1);
+  if (targetIndex < 0) {
     show(viewId);
     return;
   }
@@ -180,16 +182,73 @@ function backTo(viewId) {
   history.back();
 }
 
-window.addEventListener("popstate", (event) => {
+function replaceCurrentView(viewId) {
+  if (viewHistory[viewHistoryIndex] !== viewId) viewHistory[viewHistoryIndex] = viewId;
+  history.replaceState({ appView: viewId, appIndex: viewHistoryIndex }, "");
+  activateView(viewId);
+}
+
+async function refreshReturnedView(viewId) {
+  if (viewId === "view-library") {
+    await loadLibrary($("search-input").value);
+  } else if (viewId === "view-doc" && currentDocId) {
+    await refreshDoc();
+  } else if (viewId === "view-page" && currentDocId) {
+    await refreshDoc();
+    if (currentPageIdx < 0 || currentPageIdx >= currentDoc.pages.length) {
+      backTo(pageReturnView);
+      return;
+    }
+    const page = currentDoc.pages[currentPageIdx];
+    pageRotationDelta = 0;
+    updatePreviewPageNavigation();
+    const image = $("page-img");
+    image.onload = updatePageZoom;
+    image.src = src(page.work, bust);
+  }
+}
+
+window.addEventListener("popstate", async (event) => {
   if ($("mask").classList.contains("active") && !event.state?.appOverlay) closeSheet();
   const { appView, appIndex } = event.state || {};
+  const activeView = document.querySelector(".view.active")?.id;
+
+  if (!pendingBackTarget && activeView === "view-page" && appView === "view-capture" &&
+      pageReturnView !== "view-capture") {
+    pendingBackTarget = pageReturnView;
+    history.back();
+    return;
+  }
+
+  if (!pendingBackTarget && activeView === "view-capture" && appView !== "view-capture" &&
+      captureReturnView && appView !== captureReturnView) {
+    pendingBackTarget = captureReturnView;
+    history.back();
+    return;
+  }
+
+  if (activeView === "view-capture" && appView !== "view-capture") {
+    try {
+      await discardEmptyNewCapture();
+    } catch (error) {
+      console.error("清理空扫描文档失败：", error);
+    }
+  }
+
   if (pendingBackTarget) {
     if (appView === pendingBackTarget) {
       pendingBackTarget = null;
       viewHistoryIndex = Number.isInteger(appIndex) ? appIndex : viewHistory.lastIndexOf(appView);
       viewHistory.splice(viewHistoryIndex + 1);
       activateView(appView);
-      if (appView === "view-capture") startCam();
+      if (appView === "view-capture") await startCam();
+      if (activeView === "view-capture" || appView === captureReturnView) captureReturnView = null;
+      try {
+        await refreshReturnedView(appView);
+      } catch (error) {
+        console.error("返回页面刷新失败：", error);
+        toast("返回后刷新页面失败：" + error);
+      }
     } else {
       history.back();
     }
@@ -202,7 +261,16 @@ window.addEventListener("popstate", (event) => {
   }
   viewHistoryIndex = Number.isInteger(appIndex) ? appIndex : 0;
   activateView(appView);
+  if (activeView === "view-capture" && appView !== "view-capture") captureReturnView = null;
   if (appView === "view-capture") startCam();
+  if (activeView !== appView) {
+    try {
+      await refreshReturnedView(appView);
+    } catch (error) {
+      console.error("返回页面刷新失败：", error);
+      toast("返回后刷新页面失败：" + error);
+    }
+  }
 });
 
 // ---------------- 主题 ----------------
@@ -318,7 +386,7 @@ async function refreshDoc() {
     grid.appendChild(cell);
   });
 }
-$("btn-doc-back").onclick = () => { loadLibrary($("search-input").value); backTo("view-library"); };
+$("btn-doc-back").onclick = () => backTo("view-library");
 $("doc-title").addEventListener("change", async (e) => {
   await call("doc_rename", { docId: currentDocId, title: e.target.value });
 });
@@ -496,16 +564,20 @@ $("btn-export").onclick = () => {
 let camStream = null;
 let importedInSession = 0;
 let captureStartPageCount = 0;
+let captureCreatedDoc = false;
 
 $("btn-new-scan").onclick = async () => {
   const doc = await call("doc_create", { title: "" });
   currentDocId = doc.id;
   currentDoc = { meta: doc, pages: [] };
+  captureCreatedDoc = true;
   openCapture();
 };
 $("btn-add-page").onclick = openCapture;
 
 async function openCapture() {
+  if (document.querySelector(".view.active")?.id === "view-doc") captureCreatedDoc = false;
+  captureReturnView = document.querySelector(".view.active")?.id || "view-library";
   importedInSession = 0;
   captureStartPageCount = currentDoc.pages.length;
   $("queue-strip").innerHTML = "";
@@ -545,8 +617,36 @@ function stopCam() {
 }
 async function finishCapture() {
   stopCam();
-  await refreshDoc();
-  show("view-doc");
+  if (captureCreatedDoc && currentDoc?.pages.length === 0) {
+    try {
+      await discardEmptyNewCapture();
+    } catch (error) {
+      console.error("清理空扫描文档失败：", error);
+      await startCam();
+      return;
+    }
+    captureReturnView = null;
+    replaceCurrentView("view-library");
+    await loadLibrary($("search-input").value);
+    return;
+  }
+  if (captureReturnView === "view-doc") {
+    backTo("view-doc");
+  } else {
+    await refreshDoc();
+    captureCreatedDoc = false;
+    captureReturnView = null;
+    replaceCurrentView("view-doc");
+  }
+}
+async function discardEmptyNewCapture() {
+  if (!captureCreatedDoc) return;
+  if (currentDoc?.pages.length === 0 && currentDocId) {
+    await call("doc_delete", { docId: currentDocId });
+    currentDocId = null;
+    currentDoc = null;
+  }
+  captureCreatedDoc = false;
 }
 $("btn-cam-close").onclick = finishCapture;
 $("btn-cam-done").onclick = finishCapture;
@@ -702,7 +802,7 @@ function navigatePreviewPage(delta) {
   if (nextIdx < 0 || nextIdx >= currentDoc.pages.length) return;
   openPage(nextIdx, pageReturnView);
 }
-$("btn-page-back").onclick = async () => { await refreshDoc(); backTo(pageReturnView); };
+$("btn-page-back").onclick = () => backTo(pageReturnView);
 $("btn-page-prev").onclick = () => navigatePreviewPage(-1);
 $("btn-page-next").onclick = () => navigatePreviewPage(1);
 $("btn-page-edit").onclick = () => openEditor(currentPageIdx);
@@ -1261,11 +1361,7 @@ function quadIsConvex(q) {
   return true;
 }
 
-$("btn-editor-cancel").onclick = async () => {
-  await refreshDoc();
-  if (editorReturnView === "view-page") $("page-img").src = src(currentDoc.pages[currentPageIdx].work, bust);
-  backTo(editorReturnView);
-};
+$("btn-editor-cancel").onclick = () => backTo(editorReturnView);
 async function rotateEditorBy(direction) {
   if (editorRotationBusy) {
     editorRotationQueue += direction;
@@ -1361,11 +1457,7 @@ document.querySelectorAll(".filter-chip").forEach((chip) => {
     } finally { loading(false); }
   };
 });
-$("btn-editor-done").onclick = async () => {
-  await refreshDoc();
-  if (editorReturnView === "view-page") $("page-img").src = src(currentDoc.pages[currentPageIdx].work, bust);
-  backTo(editorReturnView);
-};
+$("btn-editor-done").onclick = () => backTo(editorReturnView);
 
 window.addEventListener("scanking-native-menu", (event) => {
   const activeView = document.querySelector(".view.active")?.id;

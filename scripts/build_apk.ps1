@@ -256,6 +256,10 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
+import androidx.activity.OnBackPressedCallback
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
@@ -273,10 +277,35 @@ class MainActivity : TauriActivity() {
     } catch (e: Throwable) {
       Log.e("ScanKing", "nativeInit failed", e)
     }
+    onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+      override fun handleOnBackPressed() {
+        val webView = findWebView(window.decorView)
+        if (webView?.canGoBack() == true) {
+          webView.goBack()
+        } else {
+          isEnabled = false
+          try {
+            onBackPressedDispatcher.onBackPressed()
+          } finally {
+            isEnabled = true
+          }
+        }
+      }
+    })
     if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
         != PackageManager.PERMISSION_GRANTED) {
       ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
     }
+  }
+
+  private fun findWebView(view: View): WebView? {
+    if (view is WebView) return view
+    if (view is ViewGroup) {
+      for (i in 0 until view.childCount) {
+        findWebView(view.getChildAt(i))?.let { return it }
+      }
+    }
+    return null
   }
 }
 "@

@@ -71,11 +71,19 @@ async function copyText(text) {
 
 // ---------------- 弹层 ----------------
 function openSheet(html) {
+  if (!$("mask").classList.contains("active")) {
+    const state = history.state || { appView: "view-library", appIndex: viewHistoryIndex };
+    history.pushState({ ...state, appOverlay: true }, "");
+  }
   $("sheet").innerHTML = html;
   $("mask").classList.add("active");
 }
 function closeSheet() {
   $("mask").classList.remove("active");
+  if (history.state?.appOverlay) {
+    const { appView, appIndex } = history.state;
+    history.replaceState({ appView, appIndex }, "");
+  }
 }
 $("mask").addEventListener("click", (e) => {
   if (e.target === $("mask")) closeSheet();
@@ -142,10 +150,60 @@ function textSheet(title, text) {
 }
 
 // ---------------- 视图切换 ----------------
-function show(viewId) {
+const viewHistory = ["view-library"];
+let viewHistoryIndex = 0;
+let pendingBackTarget = null;
+history.replaceState({ appView: "view-library", appIndex: 0 }, "");
+
+function activateView(viewId) {
+  const activeView = document.querySelector(".view.active");
+  if (activeView && activeView.id !== viewId && activeView.id === "view-capture") stopCam();
   document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
   $(viewId).classList.add("active");
 }
+
+function show(viewId) {
+  if (document.querySelector(".view.active")?.id === viewId) return;
+  viewHistory.splice(viewHistoryIndex + 1);
+  viewHistoryIndex++;
+  viewHistory[viewHistoryIndex] = viewId;
+  history.pushState({ appView: viewId, appIndex: viewHistoryIndex }, "");
+  activateView(viewId);
+}
+
+function backTo(viewId) {
+  if (viewHistory.lastIndexOf(viewId, viewHistoryIndex) < 0) {
+    show(viewId);
+    return;
+  }
+  pendingBackTarget = viewId;
+  history.back();
+}
+
+window.addEventListener("popstate", (event) => {
+  if ($("mask").classList.contains("active") && !event.state?.appOverlay) closeSheet();
+  const { appView, appIndex } = event.state || {};
+  if (pendingBackTarget) {
+    if (appView === pendingBackTarget) {
+      pendingBackTarget = null;
+      viewHistoryIndex = Number.isInteger(appIndex) ? appIndex : viewHistory.lastIndexOf(appView);
+      viewHistory.splice(viewHistoryIndex + 1);
+      activateView(appView);
+      if (appView === "view-capture") startCam();
+    } else {
+      history.back();
+    }
+    return;
+  }
+  if (typeof appView !== "string" || !$(appView)?.classList.contains("view")) {
+    activateView("view-library");
+    viewHistoryIndex = 0;
+    return;
+  }
+  viewHistoryIndex = Number.isInteger(appIndex) ? appIndex : 0;
+  activateView(appView);
+  if (appView === "view-capture") startCam();
+});
 
 // ---------------- 主题 ----------------
 function applyTheme(mode) {
@@ -166,7 +224,7 @@ $("btn-theme").onclick = () => {
 let currentDocId = null;
 let currentDoc = null; // DocDetail {meta, pages}
 let currentPageIdx = -1;
-let selectMode = false;
+let selectMode = null;
 let selected = [];
 let bust = Date.now();
 
@@ -205,7 +263,7 @@ function docCardMenu(d) {
         await call("doc_set_tags", { docId: d.id, tags });
         loadLibrary($("search-input").value);
       }) },
-    { label: "删除文档", danger: true, fn: () => confirmSheet(`删除「${d.title}」？所有页面将一并删除`, "删除", async () => { await call("doc_delete", { docId: d.id }); loadLibrary($("search-input").value); }) },
+    { label: "删除文档", danger: true, fn: () => confirmSheet(`删除「${d.title}」？所有页面将一并删除`, "删除", async () => { await call("doc_delete", { docId: d.id }); await loadLibrary($("search-input").value); }) },
   ]);
 }
 let searchTimer = null;
@@ -231,7 +289,7 @@ function attachPress(el, onTap, onLong) {
 // ---------------- 文档详情 ----------------
 async function openDoc(docId) {
   currentDocId = docId;
-  selectMode = false;
+  selectMode = null;
   selected = [];
   await refreshDoc();
   show("view-doc");
@@ -241,6 +299,7 @@ async function refreshDoc() {
   $("doc-title").value = currentDoc.meta.title;
   const grid = $("page-grid");
   grid.innerHTML = "";
+  updatePageSelectionActions();
   $("doc-empty").style.display = currentDoc.pages.length ? "none" : "block";
   currentDoc.pages.forEach((p, i) => {
     const cell = document.createElement("div");
@@ -259,7 +318,7 @@ async function refreshDoc() {
     grid.appendChild(cell);
   });
 }
-$("btn-doc-back").onclick = () => { loadLibrary($("search-input").value); show("view-library"); };
+$("btn-doc-back").onclick = () => { loadLibrary($("search-input").value); backTo("view-library"); };
 $("doc-title").addEventListener("change", async (e) => {
   await call("doc_rename", { docId: currentDocId, title: e.target.value });
 });
@@ -280,31 +339,51 @@ $("btn-doc-menu").onclick = () => {
         } catch { loading(false); }
       } },
     { label: "证件拼页（选两页合成 A4）", fn: startIdCard },
+    { label: "批量旋转页面", fn: startBatchRotate },
     { label: "查看全部识别文本", fn: async () => {
         const t = await call("doc_ocr_text", { docId: currentDocId });
         t.trim() ? textSheet("识别文本", t) : toast("还没有已识别的页面");
       } },
     { label: "删除文档", danger: true, fn: () => confirmSheet("删除整个文档？", "删除", async () => {
         await call("doc_delete", { docId: currentDocId });
-        loadLibrary();
-        show("view-library");
+        await loadLibrary();
+        backTo("view-library");
       }) },
   ]);
 };
 function startIdCard() {
   if (currentDoc.pages.length < 2) return toast("至少需要两页");
-  selectMode = true;
+  selectMode = "idcard";
   selected = [];
   toast("依次点选两页（正面、反面）");
   refreshDoc();
+}
+function startBatchRotate() {
+  if (!currentDoc.pages.length) return toast("文档没有页面");
+  selectMode = "rotate";
+  selected = [];
+  toast("选择要旋转的页面，然后使用底部旋转按钮");
+  refreshDoc();
+}
+function updatePageSelectionActions() {
+  const selectingForRotation = selectMode === "rotate";
+  $("page-selection-actions").style.display = selectingForRotation ? "flex" : "none";
+  $("btn-add-page").style.display = selectingForRotation ? "none" : "";
+  $("btn-doc-ocr").style.display = selectingForRotation ? "none" : "";
+  $("btn-export").style.display = selectingForRotation ? "none" : "";
+  $("page-selection-count").textContent = `已选 ${selected.length} 页`;
 }
 async function toggleSelect(pageId) {
   const i = selected.indexOf(pageId);
   if (i >= 0) selected.splice(i, 1);
   else selected.push(pageId);
+  if (selectMode === "rotate") {
+    updatePageSelectionActions();
+    return refreshDoc();
+  }
   if (selected.length === 2) {
     const [a, b] = selected;
-    selectMode = false;
+    selectMode = null;
     selected = [];
     loading(true, "正在合成证件页…");
     try {
@@ -319,6 +398,43 @@ async function toggleSelect(pageId) {
     refreshDoc();
   }
 }
+$("btn-cancel-page-selection").onclick = () => {
+  selectMode = null;
+  selected = [];
+  refreshDoc();
+};
+async function rotateSelectedPages(direction) {
+  if (selectMode !== "rotate") return;
+  if (!selected.length) return toast("请先选择页面");
+  const pageIds = [...selected];
+  loading(true, `正在旋转 0/${pageIds.length} 页…`);
+  try {
+    for (let i = 0; i < pageIds.length; i++) {
+      const page = currentDoc.pages.find((item) => item.meta.id === pageIds[i]);
+      if (!page) throw new Error(`找不到页面：${pageIds[i]}`);
+      const info = await call("page_set_geometry", {
+        docId: currentDocId,
+        pageId: page.meta.id,
+        quad: page.meta.quad,
+        rotation: (page.meta.rotation + direction + 4) % 4,
+      });
+      currentDoc.pages[currentDoc.pages.findIndex((item) => item.meta.id === page.meta.id)] = info;
+      bust = Date.now();
+      loading(true, `正在旋转 ${i + 1}/${pageIds.length} 页…`);
+    }
+    selectMode = null;
+    selected = [];
+    toast(`已旋转 ${pageIds.length} 页`);
+  } catch (error) {
+    console.error("批量旋转页面失败：", error);
+    toast("批量旋转未完成，已完成的页面已保留");
+  } finally {
+    loading(false);
+    await refreshDoc();
+  }
+}
+$("btn-rotate-selected-ccw").onclick = () => rotateSelectedPages(-1);
+$("btn-rotate-selected-cw").onclick = () => rotateSelectedPages(1);
 function pageMenu(idx) {
   const p = currentDoc.pages[idx];
   const ids = currentDoc.pages.map((x) => x.meta.id);
@@ -329,7 +445,7 @@ function pageMenu(idx) {
     { label: "分享图片（微信等）", fn: () => sharePage(idx) },
     ...(idx > 0 ? [{ label: "前移", fn: async () => { [ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]]; await call("pages_reorder", { docId: currentDocId, pageIds: ids }); refreshDoc(); } }] : []),
     ...(idx < ids.length - 1 ? [{ label: "后移", fn: async () => { [ids[idx + 1], ids[idx]] = [ids[idx], ids[idx + 1]]; await call("pages_reorder", { docId: currentDocId, pageIds: ids }); refreshDoc(); } }] : []),
-    { label: "删除此页", danger: true, fn: () => confirmSheet("删除此页？", "删除", async () => { await call("page_delete", { docId: currentDocId, pageId: p.meta.id }); refreshDoc(); }) },
+    { label: "删除此页", danger: true, fn: () => confirmSheet("删除此页？", "删除", async () => { await call("page_delete", { docId: currentDocId, pageId: p.meta.id }); await refreshDoc(); }) },
   ]);
 }
 
@@ -379,6 +495,7 @@ $("btn-export").onclick = () => {
 // ---------------- 相机 / 导入 ----------------
 let camStream = null;
 let importedInSession = 0;
+let captureStartPageCount = 0;
 
 $("btn-new-scan").onclick = async () => {
   const doc = await call("doc_create", { title: "" });
@@ -390,19 +507,34 @@ $("btn-add-page").onclick = openCapture;
 
 async function openCapture() {
   importedInSession = 0;
+  captureStartPageCount = currentDoc.pages.length;
   $("queue-strip").innerHTML = "";
   updateQueueCount();
   show("view-capture");
+  await startCam();
+}
+let camStartPromise = null;
+async function startCam() {
+  if (camStream || camStartPromise) return camStartPromise;
   $("cam-fallback").style.display = "none";
-  try {
-    camStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment", width: { ideal: 2560 }, height: { ideal: 1440 } },
-      audio: false,
-    });
-    $("cam-video").srcObject = camStream;
-  } catch (e) {
-    $("cam-fallback").style.display = "flex";
-  }
+  camStartPromise = (async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 2560 }, height: { ideal: 1440 } },
+        audio: false,
+      });
+      if (document.querySelector(".view.active")?.id !== "view-capture") {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      camStream = stream;
+      $("cam-video").srcObject = camStream;
+    } catch (e) {
+      $("cam-fallback").style.display = "flex";
+    }
+  })();
+  await camStartPromise;
+  camStartPromise = null;
 }
 function stopCam() {
   if (camStream) {
@@ -448,9 +580,16 @@ async function importBlob(blob) {
     const info = await call("page_import", { docId: currentDocId, data });
     importedInSession++;
     bust = Date.now();
-    const img = document.createElement("img");
-    img.src = src(info.thumb, bust);
-    $("queue-strip").appendChild(img);
+    const pageIdx = currentDoc.pages.length;
+    currentDoc.pages.push(info);
+    const thumb = document.createElement("button");
+    thumb.className = "queue-thumb";
+    thumb.type = "button";
+    thumb.dataset.pageIndex = pageIdx;
+    thumb.setAttribute("aria-label", `预览第 ${pageIdx + 1} 页`);
+    thumb.innerHTML = `<img src="${src(info.thumb, bust)}" alt="" />`;
+    thumb.onclick = () => openPage(Number(thumb.dataset.pageIndex), "view-capture");
+    $("queue-strip").appendChild(thumb);
     if ($("queue-strip").children.length > 5) $("queue-strip").removeChild($("queue-strip").firstChild);
     updateQueueCount();
   } finally {
@@ -496,18 +635,208 @@ async function openPdf(path) {
 }
 
 // ---------------- 页面查看 ----------------
-function openPage(idx) {
+let pageReturnView = "view-doc";
+let pageZoom = 1;
+let pageOffsetX = 0;
+let pageOffsetY = 0;
+let pageRotationDelta = 0;
+let pageRotationSaving = false;
+const pagePointers = new Map();
+let pageGesture = null;
+let lastPageTap = 0;
+
+function updatePageZoom() {
+  const image = $("page-img");
+  const angle = pageRotationDelta * Math.PI / 2;
+  if (image.naturalWidth && image.naturalHeight) {
+    const viewer = $("page-viewer");
+    const style = getComputedStyle(viewer);
+    const width = viewer.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const height = viewer.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    const cos = Math.abs(Math.cos(angle)), sin = Math.abs(Math.sin(angle));
+    const scale = Math.min(
+      width / (cos * image.naturalWidth + sin * image.naturalHeight),
+      height / (sin * image.naturalWidth + cos * image.naturalHeight)
+    );
+    image.style.maxWidth = "none";
+    image.style.maxHeight = "none";
+    image.style.width = `${image.naturalWidth * scale}px`;
+    image.style.height = `${image.naturalHeight * scale}px`;
+  }
+  image.style.transform =
+    `translate(${pageOffsetX}px, ${pageOffsetY}px) scale(${pageZoom}) rotate(${pageRotationDelta * 90}deg)`;
+  $("zoom-level").textContent = `${Math.round(pageZoom * 100)}%`;
+}
+function setPageZoom(zoom) {
+  pageZoom = Math.max(1, Math.min(4, zoom));
+  if (pageZoom === 1) {
+    pageOffsetX = 0;
+    pageOffsetY = 0;
+  }
+  updatePageZoom();
+}
+function openPage(idx, returnView = "view-doc") {
+  if (!currentDoc || idx < 0 || idx >= currentDoc.pages.length) return;
   currentPageIdx = idx;
+  pageReturnView = returnView;
+  pagePointers.clear();
+  pageGesture = null;
+  lastPageTap = 0;
   const p = currentDoc.pages[idx];
-  $("page-title").textContent = `第 ${idx + 1} 页`;
-  $("page-img").src = src(p.work, bust);
+  pageRotationDelta = 0;
+  setPageZoom(1);
+  updatePreviewPageNavigation();
+  const image = $("page-img");
+  image.onload = updatePageZoom;
+  image.src = src(p.work, bust);
   show("view-page");
 }
-$("btn-page-back").onclick = () => { refreshDoc(); show("view-doc"); };
+function updatePreviewPageNavigation() {
+  $("page-title").textContent = `第 ${currentPageIdx + 1}/${currentDoc.pages.length} 页`;
+  $("btn-page-prev").disabled = pageRotationSaving || currentPageIdx <= 0;
+  $("btn-page-next").disabled = pageRotationSaving || currentPageIdx >= currentDoc.pages.length - 1;
+}
+function navigatePreviewPage(delta) {
+  if (pageRotationSaving) return;
+  const nextIdx = currentPageIdx + delta;
+  if (nextIdx < 0 || nextIdx >= currentDoc.pages.length) return;
+  openPage(nextIdx, pageReturnView);
+}
+$("btn-page-back").onclick = async () => { await refreshDoc(); backTo(pageReturnView); };
+$("btn-page-prev").onclick = () => navigatePreviewPage(-1);
+$("btn-page-next").onclick = () => navigatePreviewPage(1);
 $("btn-page-edit").onclick = () => openEditor(currentPageIdx);
 $("btn-page-save").onclick = () => savePageToGallery(currentPageIdx);
 $("btn-page-share").onclick = () => sharePage(currentPageIdx);
+$("btn-zoom-out").onclick = () => setPageZoom(pageZoom - 0.25);
+$("btn-zoom-in").onclick = () => setPageZoom(pageZoom + 0.25);
+$("btn-zoom-reset").onclick = () => setPageZoom(1);
+
+const pageViewer = $("page-viewer");
+pageViewer.addEventListener("pointerdown", (e) => {
+  if (pageRotationSaving || e.target.closest(".zoom-controls")) return;
+  pageViewer.setPointerCapture(e.pointerId);
+  pagePointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pagePointers.size === 1) {
+    pageGesture = { type: "pan", x: e.clientX, y: e.clientY, offsetX: pageOffsetX, offsetY: pageOffsetY, tap: Date.now() };
+  } else if (pagePointers.size === 2) {
+    const pts = [...pagePointers.values()];
+    const rect = pageViewer.getBoundingClientRect();
+    const cx = (pts[0][0] + pts[1][0]) / 2 - rect.left - rect.width / 2;
+    const cy = (pts[0][1] + pts[1][1]) / 2 - rect.top - rect.height / 2;
+    pageGesture = {
+      type: "pinch",
+      distance: Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]),
+      angle: Math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]),
+      startRotation: pageRotationDelta,
+      zoom: pageZoom,
+      anchorX: (cx - pageOffsetX) / pageZoom,
+      anchorY: (cy - pageOffsetY) / pageZoom,
+    };
+  }
+});
+pageViewer.addEventListener("pointermove", (e) => {
+  if (!pagePointers.has(e.pointerId)) return;
+  pagePointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pagePointers.size === 1 && pageGesture?.type === "pan") {
+    if (pageZoom > 1) {
+      pageOffsetX = pageGesture.offsetX + e.clientX - pageGesture.x;
+      pageOffsetY = pageGesture.offsetY + e.clientY - pageGesture.y;
+      updatePageZoom();
+    }
+  } else if (pagePointers.size === 2 && pageGesture?.type === "pinch") {
+    const pts = [...pagePointers.values()];
+    const distance = Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]);
+    const angle = Math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]);
+    const rect = pageViewer.getBoundingClientRect();
+    const cx = (pts[0][0] + pts[1][0]) / 2 - rect.left - rect.width / 2;
+    const cy = (pts[0][1] + pts[1][1]) / 2 - rect.top - rect.height / 2;
+    pageZoom = Math.max(1, Math.min(4, pageGesture.zoom * distance / pageGesture.distance));
+    pageRotationDelta = pageGesture.startRotation +
+      normalizeAngle(angle - pageGesture.angle) / (Math.PI / 2);
+    pageOffsetX = cx - pageGesture.anchorX * pageZoom;
+    pageOffsetY = cy - pageGesture.anchorY * pageZoom;
+    if (pageZoom === 1) pageOffsetX = pageOffsetY = 0;
+    updatePageZoom();
+  }
+});
+function endPagePointer(e) {
+  const wasSingleTap = pagePointers.size === 1 && pageGesture?.type === "pan" &&
+    Date.now() - pageGesture.tap < 280 &&
+    Math.hypot(e.clientX - pageGesture.x, e.clientY - pageGesture.y) < 12;
+  pagePointers.delete(e.pointerId);
+  if (pagePointers.size === 1) {
+    const [x, y] = [...pagePointers.values()][0];
+    pageGesture = { type: "pan", x, y, offsetX: pageOffsetX, offsetY: pageOffsetY, tap: 0 };
+  } else {
+    pageGesture = null;
+  }
+  if (pagePointers.size === 0 && pageRotationDelta !== 0) {
+    void finishPageRotation();
+  }
+  if (wasSingleTap) {
+    const now = Date.now();
+    if (now - lastPageTap < 320) {
+      setPageZoom(pageZoom > 1 ? 1 : 2);
+      lastPageTap = 0;
+    } else {
+      lastPageTap = now;
+    }
+  }
+}
+async function finishPageRotation() {
+  const turns = Math.round(pageRotationDelta);
+  pageRotationDelta = turns;
+  updatePageZoom();
+  if (!turns) return;
+
+  pageRotationSaving = true;
+  updatePreviewPageNavigation();
+  const page = currentDoc.pages[currentPageIdx];
+  const rotation = (page.meta.rotation + turns + 4) % 4;
+  loading(true, "正在保存页面方向…");
+  try {
+    const info = await call("page_set_geometry", {
+      docId: currentDocId,
+      pageId: page.meta.id,
+      quad: page.meta.quad,
+      rotation,
+    });
+    bust = Date.now();
+    currentDoc.pages[currentPageIdx] = info;
+    const image = $("page-img");
+    await new Promise((resolve) => {
+      image.onload = () => {
+        pageRotationDelta = 0;
+        updatePageZoom();
+        resolve();
+      };
+      image.onerror = () => {
+        pageRotationDelta = 0;
+        updatePageZoom();
+        toast("页面预览加载失败");
+        resolve();
+      };
+      image.src = src(info.work, bust);
+    });
+  } catch (error) {
+    console.error("保存页面旋转失败：", error);
+    pageRotationDelta = 0;
+    updatePageZoom();
+  } finally {
+    loading(false);
+    pageRotationSaving = false;
+    updatePreviewPageNavigation();
+  }
+}
+pageViewer.addEventListener("pointerup", endPagePointer);
+pageViewer.addEventListener("pointercancel", endPagePointer);
+pageViewer.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  setPageZoom(pageZoom + (e.deltaY < 0 ? 0.2 : -0.2));
+}, { passive: false });
 $("btn-page-menu").onclick = () => {
+  const returnView = pageReturnView;
   menuSheet("页面操作", [
     { label: "快速旋转 90°", fn: async () => {
         const p = currentDoc.pages[currentPageIdx];
@@ -516,7 +845,7 @@ $("btn-page-menu").onclick = () => {
           await call("page_set_geometry", { docId: currentDocId, pageId: p.meta.id, quad: p.meta.quad, rotation: (p.meta.rotation + 1) % 4 });
           bust = Date.now();
           currentDoc = await call("doc_get", { docId: currentDocId });
-          openPage(currentPageIdx);
+          openPage(currentPageIdx, pageReturnView);
         } finally { loading(false); }
       } },
     { label: "查看本页识别文本", fn: async () => {
@@ -529,7 +858,22 @@ $("btn-page-menu").onclick = () => {
         const p = currentDoc.pages[currentPageIdx];
         await call("page_delete", { docId: currentDocId, pageId: p.meta.id });
         await refreshDoc();
-        show("view-doc");
+        if (returnView === "view-capture") {
+          const deletedIdx = currentPageIdx;
+          $("queue-strip").querySelectorAll(".queue-thumb").forEach((thumb) => {
+            const pageIdx = Number(thumb.dataset.pageIndex);
+            if (pageIdx === deletedIdx) {
+              thumb.remove();
+            } else if (pageIdx > deletedIdx) {
+              thumb.dataset.pageIndex = pageIdx - 1;
+              thumb.setAttribute("aria-label", `预览第 ${pageIdx} 页`);
+              thumb.onclick = () => openPage(Number(thumb.dataset.pageIndex), "view-capture");
+            }
+          });
+          if (deletedIdx >= captureStartPageCount) importedInSession--;
+          updateQueueCount();
+        }
+        backTo(returnView);
       }) },
   ]);
 };
@@ -626,22 +970,71 @@ const editor = {
   dragging: -1,
   pendingFilter: "enhance",
 };
+let editorReturnView = "view-doc";
+let editorNavigating = false;
+let editorRotationBusy = false;
+let editorRotationQueue = 0;
+const editorTouchPoints = new Map();
+let editorTouchRotation = null;
 
 async function openEditor(idx) {
+  editorReturnView = document.querySelector(".view.active")?.id || "view-doc";
+  show("view-editor");
+  await loadEditorPage(idx);
+}
+async function loadEditorPage(idx) {
   currentPageIdx = idx;
+  editorTouchPoints.clear();
+  editorTouchRotation = null;
   const p = currentDoc.pages[idx];
   editor.page = p;
   editor.stage = "crop";
   editor.quad = (p.meta.quad || p.quad).map((q) => [q[0], q[1]]);
   editor.rotation = p.meta.rotation;
   editor.pendingFilter = p.meta.filter;
-  $("editor-title").textContent = "调整边框";
+  updateEditorNavigation();
   $("crop-bar").style.display = "flex";
   $("filter-bar").style.display = "none";
-  show("view-editor");
   await loadEditorImage(src(p.preview, bust), 1 / p.preview_scale);
   drawEditor();
 }
+function updateEditorNavigation() {
+  $("editor-title").textContent = `第 ${currentPageIdx + 1}/${currentDoc.pages.length} 页`;
+  $("btn-editor-prev").disabled = editorNavigating || currentPageIdx <= 0;
+  $("btn-editor-next").disabled = editorNavigating || currentPageIdx >= currentDoc.pages.length - 1;
+}
+async function navigateEditor(delta) {
+  const nextIdx = currentPageIdx + delta;
+  if (editorNavigating || nextIdx < 0 || nextIdx >= currentDoc.pages.length) return;
+  editorNavigating = true;
+  updateEditorNavigation();
+  loading(true, "保存当前页并切换…");
+  try {
+    if (editor.stage === "crop") {
+      if (!quadIsConvex(editor.quad)) return toast("边框形状无效，四角不能交叉");
+      const info = await call("page_set_geometry", {
+        docId: currentDocId,
+        pageId: editor.page.meta.id,
+        quad: editor.quad.map((q) => [q[0], q[1]]),
+        rotation: editor.rotation,
+      });
+      currentDoc.pages[currentPageIdx] = info;
+      bust = Date.now();
+    }
+    await loadEditorPage(nextIdx);
+  } finally {
+    loading(false);
+    editorNavigating = false;
+    updateEditorNavigation();
+  }
+}
+$("btn-editor-prev").onclick = () => navigateEditor(-1);
+$("btn-editor-next").onclick = () => navigateEditor(1);
+$("filter-chips-scroll").addEventListener("wheel", (e) => {
+  if (e.deltaY === 0) return;
+  e.preventDefault();
+  $("filter-chips-scroll").scrollLeft += e.deltaY;
+}, { passive: false });
 function loadEditorImage(url, toOrig) {
   return new Promise((resolve) => {
     const img = new Image();
@@ -663,7 +1056,10 @@ function fitCanvas() {
   const img = editor.img;
   if (!img) return;
   const pad = 26 * dpr;
-  const s = Math.min((canvas.width - pad * 2) / img.width, (canvas.height - pad * 2) / img.height);
+  const rotated = editor.stage === "crop" && editor.rotation % 2 !== 0;
+  const displayWidth = rotated ? img.height : img.width;
+  const displayHeight = rotated ? img.width : img.height;
+  const s = Math.min((canvas.width - pad * 2) / displayWidth, (canvas.height - pad * 2) / displayHeight);
   editor.scale = s;
   editor.ox = (canvas.width - img.width * s) / 2;
   editor.oy = (canvas.height - img.height * s) / 2;
@@ -679,11 +1075,34 @@ function c2o(x, y) {
   const ps = 1 / editor.toOrig;
   return [(x - editor.ox) / (ps * editor.scale), (y - editor.oy) / (ps * editor.scale)];
 }
+function editorDisplayAngle() {
+  return editor.stage === "crop" ? (editor.rotation % 4) * Math.PI / 2 : 0;
+}
+function rotateEditorPoint(x, y, angle = editorDisplayAngle()) {
+  const cx = canvas.width / 2, cy = canvas.height / 2;
+  const dx = x - cx, dy = y - cy;
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  return [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos];
+}
+function editorPointerPos(e) {
+  const [x, y] = evPos(e);
+  return rotateEditorPoint(x, y, -editorDisplayAngle());
+}
 function drawEditor() {
   if (!editor.img) return;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const angle = editorDisplayAngle();
+  ctx.save();
+  if (angle) {
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(angle);
+    ctx.translate(-canvas.width / 2, -canvas.height / 2);
+  }
   ctx.drawImage(editor.img, editor.ox, editor.oy, editor.img.width * editor.scale, editor.img.height * editor.scale);
-  if (editor.stage !== "crop") return;
+  if (editor.stage !== "crop") {
+    ctx.restore();
+    return;
+  }
 
   const pts = editor.quad.map(o2c);
   const dpr = window.devicePixelRatio || 1;
@@ -719,9 +1138,10 @@ function drawEditor() {
     ctx.lineWidth = 2 * dpr;
     ctx.stroke();
   }
+  ctx.restore();
   // 放大镜
   if (editor.dragging >= 0) {
-    const [x, y] = pts[editor.dragging];
+    const [x, y] = rotateEditorPoint(...pts[editor.dragging], angle);
     const R = 52 * dpr, Z = 2.4;
     const mx = x < canvas.width / 2 ? canvas.width - R - 14 * dpr : R + 14 * dpr;
     const my = R + 14 * dpr;
@@ -734,6 +1154,11 @@ function drawEditor() {
     ctx.translate(mx, my);
     ctx.scale(Z, Z);
     ctx.translate(-x, -y);
+    if (angle) {
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.rotate(angle);
+      ctx.translate(-canvas.width / 2, -canvas.height / 2);
+    }
     ctx.drawImage(editor.img, editor.ox, editor.oy, editor.img.width * editor.scale, editor.img.height * editor.scale);
     ctx.restore();
     // 放大镜十字
@@ -753,9 +1178,27 @@ function evPos(e) {
   const dpr = window.devicePixelRatio || 1;
   return [(e.clientX - r.left) * dpr, (e.clientY - r.top) * dpr];
 }
+function normalizeAngle(angle) {
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  while (angle < -Math.PI) angle += Math.PI * 2;
+  return angle;
+}
 canvas.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "touch") {
+    editorTouchPoints.set(e.pointerId, [e.clientX, e.clientY]);
+    canvas.setPointerCapture(e.pointerId);
+    if (editorTouchPoints.size >= 2) {
+      editor.dragging = -1;
+      const points = [...editorTouchPoints.values()];
+      editorTouchRotation = {
+        angle: Math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0]),
+        accumulated: 0,
+      };
+      return;
+    }
+  }
   if (editor.stage !== "crop") return;
-  const [x, y] = evPos(e);
+  const [x, y] = editorPointerPos(e);
   const dpr = window.devicePixelRatio || 1;
   const pts = editor.quad.map(o2c);
   let best = -1, bd = 40 * dpr;
@@ -768,8 +1211,28 @@ canvas.addEventListener("pointerdown", (e) => {
   drawEditor();
 });
 canvas.addEventListener("pointermove", (e) => {
+  if (editorTouchPoints.has(e.pointerId)) {
+    editorTouchPoints.set(e.pointerId, [e.clientX, e.clientY]);
+    if (editorTouchPoints.size >= 2) {
+      const points = [...editorTouchPoints.values()];
+      const angle = Math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0]);
+      if (!editorTouchRotation) {
+        editorTouchRotation = { angle, accumulated: 0 };
+        return;
+      }
+      editorTouchRotation.accumulated += normalizeAngle(angle - editorTouchRotation.angle);
+      editorTouchRotation.angle = angle;
+      const threshold = Math.PI / 3;
+      if (Math.abs(editorTouchRotation.accumulated) >= threshold) {
+        const direction = Math.sign(editorTouchRotation.accumulated);
+        editorTouchRotation.accumulated -= direction * threshold;
+        rotateEditorBy(direction);
+      }
+      return;
+    }
+  }
   if (editor.dragging < 0 || editor.stage !== "crop") return;
-  const [x, y] = evPos(e);
+  const [x, y] = editorPointerPos(e);
   const o = c2o(x, y);
   const p = editor.page;
   o[0] = Math.max(0, Math.min(p.meta.width - 1, o[0]));
@@ -777,7 +1240,14 @@ canvas.addEventListener("pointermove", (e) => {
   editor.quad[editor.dragging] = o;
   drawEditor();
 });
-canvas.addEventListener("pointerup", () => { editor.dragging = -1; drawEditor(); });
+function endEditorPointer(e) {
+  editorTouchPoints.delete(e.pointerId);
+  if (editorTouchPoints.size < 2) editorTouchRotation = null;
+  editor.dragging = -1;
+  drawEditor();
+}
+canvas.addEventListener("pointerup", endEditorPointer);
+canvas.addEventListener("pointercancel", endEditorPointer);
 
 function quadIsConvex(q) {
   let sign = 0;
@@ -791,11 +1261,55 @@ function quadIsConvex(q) {
   return true;
 }
 
-$("btn-editor-cancel").onclick = () => { refreshDoc(); show("view-doc"); };
-$("btn-editor-rotate").onclick = async () => {
-  editor.rotation = (editor.rotation + 1) % 4;
-  toast(`将旋转 ${editor.rotation * 90}°（应用后生效）`);
+$("btn-editor-cancel").onclick = async () => {
+  await refreshDoc();
+  if (editorReturnView === "view-page") $("page-img").src = src(currentDoc.pages[currentPageIdx].work, bust);
+  backTo(editorReturnView);
 };
+async function rotateEditorBy(direction) {
+  if (editorRotationBusy) {
+    editorRotationQueue += direction;
+    return;
+  }
+  const nextRotation = (editor.rotation + direction + 4) % 4;
+  if (editor.stage === "crop") {
+    editor.rotation = nextRotation;
+    fitCanvas();
+    drawEditor();
+    toast(`页面旋转至 ${nextRotation * 90}°，点击「下一步」应用`);
+    return;
+  }
+
+  editorRotationBusy = true;
+  const page = editor.page;
+  loading(true, "正在旋转页面…");
+  try {
+    const info = await call("page_set_geometry", {
+      docId: currentDocId,
+      pageId: page.meta.id,
+      quad: page.meta.quad,
+      rotation: nextRotation,
+    });
+    bust = Date.now();
+    editor.page = info;
+    editor.rotation = info.meta.rotation;
+    currentDoc.pages[currentPageIdx] = info;
+    await loadEditorImage(src(info.work, bust), 1);
+    drawEditor();
+    toast(`页面已旋转至 ${info.meta.rotation * 90}°`);
+  } catch (error) {
+    console.error("页面旋转失败：", error);
+  } finally {
+    loading(false);
+    editorRotationBusy = false;
+    if (editorRotationQueue !== 0) {
+      const queuedDirection = Math.sign(editorRotationQueue);
+      editorRotationQueue -= queuedDirection;
+      rotateEditorBy(queuedDirection);
+    }
+  }
+}
+$("btn-editor-rotate").onclick = () => rotateEditorBy(1);
 $("btn-auto-detect").onclick = async () => {
   const p = editor.page;
   loading(true, "重新检测…");
@@ -823,10 +1337,11 @@ $("btn-crop-next").onclick = async () => {
     bust = Date.now();
     editor.page = info;
     editor.stage = "filter";
-    $("editor-title").textContent = "选择滤镜";
+    $("editor-title").textContent = `第 ${currentPageIdx + 1}/${currentDoc.pages.length} 页`;
     $("crop-bar").style.display = "none";
     $("filter-bar").style.display = "flex";
     document.querySelectorAll(".filter-chip").forEach((c) => c.classList.toggle("active", c.dataset.filter === info.meta.filter));
+    currentDoc.pages[currentPageIdx] = info;
     await loadEditorImage(src(info.work, bust), 1);
     drawEditor();
   } finally { loading(false); }
@@ -839,6 +1354,7 @@ document.querySelectorAll(".filter-chip").forEach((chip) => {
       const info = await call("page_set_filter", { docId: currentDocId, pageId: p.meta.id, filter: chip.dataset.filter });
       bust = Date.now();
       editor.page = info;
+      currentDoc.pages[currentPageIdx] = info;
       document.querySelectorAll(".filter-chip").forEach((c) => c.classList.toggle("active", c === chip));
       await loadEditorImage(src(info.work, bust), 1);
       drawEditor();
@@ -847,8 +1363,53 @@ document.querySelectorAll(".filter-chip").forEach((chip) => {
 });
 $("btn-editor-done").onclick = async () => {
   await refreshDoc();
-  show("view-doc");
+  if (editorReturnView === "view-page") $("page-img").src = src(currentDoc.pages[currentPageIdx].work, bust);
+  backTo(editorReturnView);
 };
+
+window.addEventListener("scanking-native-menu", (event) => {
+  const activeView = document.querySelector(".view.active")?.id;
+  switch (event.detail) {
+    case "new-scan":
+      $("btn-new-scan").click();
+      break;
+    case "add-page":
+      if (activeView === "view-doc") $("btn-add-page").click();
+      else toast("请先打开一个文档");
+      break;
+    case "export-pdf":
+      if (activeView === "view-doc") $("btn-export").click();
+      else toast("请先打开一个文档");
+      break;
+    case "back":
+      if (activeView === "view-editor") $("btn-editor-cancel").click();
+      else if (activeView === "view-page") $("btn-page-back").click();
+      else if (activeView === "view-doc") $("btn-doc-back").click();
+      else if (activeView === "view-capture") $("btn-cam-done").click();
+      else toast("当前已在文档库");
+      break;
+    case "edit-page":
+      if (activeView === "view-page") $("btn-page-edit").click();
+      else toast("请先打开页面预览");
+      break;
+    case "zoom-in":
+      if (activeView === "view-page") $("btn-zoom-in").click();
+      break;
+    case "zoom-out":
+      if (activeView === "view-page") $("btn-zoom-out").click();
+      break;
+    case "zoom-reset":
+      if (activeView === "view-page") $("btn-zoom-reset").click();
+      break;
+    case "toggle-theme":
+      $("btn-theme").click();
+      break;
+    case "about":
+      openSheet("<h3>扫描王 ScanKing</h3><div>离线文档扫描与管理</div><div class=\"row\"><button class=\"btn primary\" id=\"sheet-close2\">关闭</button></div>");
+      $("sheet-close2").onclick = closeSheet;
+      break;
+  }
+});
 
 // ---------------- 启动 ----------------
 loadLibrary();

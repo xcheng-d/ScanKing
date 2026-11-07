@@ -411,6 +411,59 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::menu::MenuBuilder;
+                use tauri::menu::SubmenuBuilder;
+
+                let file_menu = SubmenuBuilder::new(app, "文件")
+                    .text("new-scan", "新建扫描")
+                    .text("add-page", "添加页面")
+                    .text("export-pdf", "导出 PDF")
+                    .separator()
+                    .text("quit", "退出")
+                    .build()?;
+                let edit_menu = SubmenuBuilder::new(app, "编辑")
+                    .text("back", "返回上一页")
+                    .text("edit-page", "编辑当前页面")
+                    .build()?;
+                let view_menu = SubmenuBuilder::new(app, "视图")
+                    .text("zoom-in", "放大预览")
+                    .text("zoom-out", "缩小预览")
+                    .text("zoom-reset", "重置预览")
+                    .separator()
+                    .text("toggle-theme", "切换深色模式")
+                    .build()?;
+                let help_menu = SubmenuBuilder::new(app, "帮助")
+                    .text("about", "关于扫描王")
+                    .build()?;
+                let menu = MenuBuilder::new(app)
+                    .item(&file_menu)
+                    .item(&edit_menu)
+                    .item(&view_menu)
+                    .item(&help_menu)
+                    .build()?;
+                app.set_menu(menu)?;
+                app.on_menu_event(|app, event| {
+                    let id = event.id().as_ref();
+                    if id == "quit" {
+                        app.exit(0);
+                        return;
+                    }
+                    let Some(window) = app.get_webview_window("main") else {
+                        eprintln!("Windows 菜单动作失败：找不到主窗口");
+                        return;
+                    };
+                    let script = format!(
+                        "window.dispatchEvent(new CustomEvent('scanking-native-menu', {{ detail: '{}' }}));",
+                        id
+                    );
+                    if let Err(error) = window.eval(&script) {
+                        eprintln!("Windows 菜单动作执行失败：{error}");
+                    }
+                });
+            }
+
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let root = data_dir.join("library");

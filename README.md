@@ -32,9 +32,11 @@
 ## 功能
 
 - 拍照或相册导入，自动检测文档边缘，透视矫正拉直
-- 手动四角微调（带放大镜）、旋转
+- 手动四角微调（带放大镜）、顺/逆时针旋转
 - 五种滤镜：原图 / 增强（提亮去底色）/ 黑白文档 / 灰度 / 去阴影
-- 多页文档：批量拍摄、排序、删除
+- 多页文档：批量拍摄、排序、删除；添加页时可点缩略图预览并直接编辑
+- 多页编辑：编辑器内直接切换页面；裁剪时可实时预览旋转；文档详情中可多选页面并批量旋转
+- 页面预览：上一页/下一页切换；支持缩放、拖动及双指扭转旋转
 - 导出 PDF（自适应页面或 A4 居中），可调图像质量
 - 离线 OCR 中英文识别（PaddleOCR v4 模型 + 纯 Rust 推理，不联网）
 - 一键分享到微信 / QQ 等（系统分享面板），图片和 PDF 均可
@@ -42,7 +44,7 @@
 - 全文搜索：按文档名、标签、识别文字搜索
 - 证件拼页：正反面合成一张 A4
 - 文档库管理：重命名、标签、深色模式，磨砂质感 Clean UI
-- 无广告、无会员、无网络请求，所有数据只存在你手机里
+- 无广告、无会员，扫描数据只保存在本地设备
 
 ## 工作原理
 
@@ -113,15 +115,19 @@ cargo tauri dev
 ```
 
 会弹出一个手机比例的窗口，扫描、滤镜、PDF、OCR 全部功能都能直接调试（相机用摄像头或"相册导入"）。
+Windows 桌面窗口提供“文件 / 编辑 / 视图 / 帮助”原生菜单，可新建扫描、添加页面、返回、编辑页面、缩放预览和切换主题。
+在 Android 上按系统返回键会优先返回应用内上一层；从文档库根界面返回才会退出应用。
 
 ### 4. 初始化 Android 工程（一次即可）
+
+若使用 `scripts\build_apk.ps1`，脚本会自动初始化 Android 工程并配置相机权限、运行时权限请求及系统返回处理；可跳过本节的手动补丁步骤。直接使用 Tauri CLI 初始化时，再按下面步骤手动配置：
 
 ```
 cargo tauri android init
 cargo tauri icon app-icon.png
 ```
 
-然后做两处小修改：
+然后配置相机权限和系统返回：
 
 **a) 相机权限声明** — 编辑 `src-tauri/gen/android/app/src/main/AndroidManifest.xml`，
 在 `<application>` 标签之前加入：
@@ -131,25 +137,66 @@ cargo tauri icon app-icon.png
 <uses-feature android:name="android.hardware.camera" android:required="false" />
 ```
 
-**b) 启动时请求相机权限** — 编辑
+**b) 相机权限与系统返回行为** — 编辑
 `src-tauri/gen/android/app/src/main/java/com/ng/scanking/MainActivity.kt`，替换为：
 
 ```kotlin
 package com.ng.scanking
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.util.Log
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
+import androidx.activity.OnBackPressedCallback
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 class MainActivity : TauriActivity() {
+  companion object {
+    @JvmStatic
+    private external fun nativeInit(context: Context)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    try {
+      nativeInit(applicationContext)
+    } catch (e: Throwable) {
+      Log.e("ScanKing", "nativeInit failed", e)
+    }
+    onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+      override fun handleOnBackPressed() {
+        val webView = findWebView(window.decorView)
+        if (webView?.canGoBack() == true) {
+          webView.goBack()
+        } else {
+          isEnabled = false
+          try {
+            onBackPressedDispatcher.onBackPressed()
+          } finally {
+            isEnabled = true
+          }
+        }
+      }
+    })
     if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
         != PackageManager.PERMISSION_GRANTED) {
       ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1001)
     }
+  }
+
+  private fun findWebView(view: View): WebView? {
+    if (view is WebView) return view
+    if (view is ViewGroup) {
+      for (i in 0 until view.childCount) {
+        findWebView(view.getChildAt(i))?.let { return it }
+      }
+    }
+    return null
   }
 }
 ```
@@ -176,6 +223,15 @@ cargo tauri android build --apk
 ```
 
 产物在 `src-tauri/gen/android/app/build/outputs/apk/`。
+
+也可以使用项目构建脚本生成 APK。默认构建可安装的 Debug 包；发布或减小 APK 体积时使用 Release，并只构建目标手机架构（常见新款 Android 手机为 `aarch64`）：
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build_apk.ps1 -Release -Target aarch64
+```
+
+Release 会启用 Rust 链接时优化、体积优化和符号剥离。OCR 模型约 16 MB，会随应用一起打包；不打包模型可进一步减小 APK，但应用将不能使用内置离线 OCR。注意：当前 `build_apk.ps1` 在模型缺失时会尝试下载模型。首次 Release 构建会生成签名密钥，请妥善备份 `scanking.keystore` 和 `src-tauri/gen/android/keystore.properties`，后续更新需要沿用同一签名。
+构建脚本会将 APK 复制到项目根目录的 `ScanKing-debug.apk` 或 `ScanKing-release.apk`。
 
 **签名**（发布用，自用 debug 包可跳过）：
 

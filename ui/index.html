@@ -60,6 +60,12 @@
         <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
         导出 PDF
       </button>
+      <div class="page-selection-actions" id="page-selection-actions" style="display:none">
+        <span id="page-selection-count">已选 0 页</span>
+        <button class="btn" id="btn-rotate-selected-ccw">逆时针 90°</button>
+        <button class="btn" id="btn-rotate-selected-cw">顺时针 90°</button>
+        <button class="btn" id="btn-cancel-page-selection">取消</button>
+      </div>
     </div>
   </div>
 
@@ -102,12 +108,24 @@
   <!-- ============ 裁剪/滤镜编辑器 ============ -->
   <div class="view" id="view-editor">
     <div class="topbar">
-      <button class="icon-btn" id="btn-editor-cancel">
-        <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      <button class="icon-btn editor-back" id="btn-editor-cancel">
+        <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+        <span>返回</span>
       </button>
-      <h1 id="editor-title" style="font-size:17px">调整边框</h1>
-      <button class="icon-btn" id="btn-editor-rotate" title="旋转">
+      <h1>编辑页面</h1>
+      <button class="icon-btn" id="btn-editor-rotate" title="顺时针旋转 90°；也可双指扭转页面" aria-label="顺时针旋转 90°；也可双指扭转页面">
         <svg viewBox="0 0 24 24"><path d="M21 8a9 9 0 1 0 .5 5"/><path d="M21 3v5h-5"/></svg>
+      </button>
+    </div>
+    <div class="editor-page-nav-bar">
+      <button class="editor-page-nav" id="btn-editor-prev" aria-label="上一页">
+        <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
+        <span>上一页</span>
+      </button>
+      <span id="editor-title">第 1/1 页</span>
+      <button class="editor-page-nav" id="btn-editor-next" aria-label="下一页">
+        <span>下一页</span>
+        <svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
       </button>
     </div>
     <div class="editor-canvas-wrap" id="editor-wrap">
@@ -120,12 +138,13 @@
       <button class="btn primary" id="btn-crop-next">下一步</button>
     </div>
     <div class="editor-bar" id="filter-bar" style="display:none">
-      <button class="filter-chip" data-filter="original">原图</button>
-      <button class="filter-chip active" data-filter="enhance">增强</button>
-      <button class="filter-chip" data-filter="bw">黑白</button>
-      <button class="filter-chip" data-filter="gray">灰度</button>
-      <button class="filter-chip" data-filter="shadow">去阴影</button>
-      <div style="flex:1"></div>
+      <div class="filter-chips-scroll" id="filter-chips-scroll">
+        <button class="filter-chip" data-filter="original">原图</button>
+        <button class="filter-chip active" data-filter="enhance">增强</button>
+        <button class="filter-chip" data-filter="bw">黑白</button>
+        <button class="filter-chip" data-filter="gray">灰度</button>
+        <button class="filter-chip" data-filter="shadow">去阴影</button>
+      </div>
       <button class="btn primary" id="btn-editor-done">完成</button>
     </div>
   </div>
@@ -133,15 +152,30 @@
   <!-- ============ 页面查看 ============ -->
   <div class="view" id="view-page">
     <div class="topbar">
-      <button class="icon-btn" id="btn-page-back">
+      <button class="icon-btn page-back" id="btn-page-back">
         <svg viewBox="0 0 24 24"><path d="M15 19 8 12l7-7"/></svg>
+        <span>返回</span>
+      </button>
+      <button class="icon-btn page-nav" id="btn-page-prev" aria-label="上一页" title="上一页">
+        <svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg>
       </button>
       <h1 id="page-title" style="font-size:17px">第 1 页</h1>
+      <button class="icon-btn page-nav" id="btn-page-next" aria-label="下一页" title="下一页">
+        <svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+      </button>
       <button class="icon-btn" id="btn-page-menu">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="19" r="1.6" fill="currentColor" stroke="none"/></svg>
       </button>
     </div>
-    <div class="page-viewer"><img id="page-img" alt="页面" /></div>
+    <div class="page-viewer" id="page-viewer">
+      <img id="page-img" alt="页面" />
+      <div class="zoom-controls" aria-label="缩放控制">
+        <button id="btn-zoom-out" aria-label="缩小">−</button>
+        <span id="zoom-level">100%</span>
+        <button id="btn-zoom-in" aria-label="放大">+</button>
+        <button id="btn-zoom-reset" aria-label="重置缩放">重置</button>
+      </div>
+    </div>
     <div class="bottombar dark">
       <button class="btn" id="btn-page-edit">编辑</button>
       <button class="btn" id="btn-page-ocr">识别</button>

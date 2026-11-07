@@ -8,10 +8,12 @@ use scanking_core::store::{DocMeta, DocSummary, PageInfo, Store};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+use std::time::Instant;
 
 struct AppState {
     store: Arc<Store>,
+    page_processing: Arc<Mutex<()>>,
     #[cfg(feature = "ocr")]
     ocr: Mutex<Option<Arc<scanking_core::ocr::OcrEngine>>>,
 }
@@ -26,6 +28,14 @@ fn err_str<E: std::fmt::Display>(e: E) -> String {
 struct DocDetail {
     meta: DocMeta,
     pages: Vec<PageInfo>,
+}
+
+#[derive(Clone, Serialize)]
+struct PageProcessingEvent {
+    doc_id: String,
+    page_id: String,
+    page: Option<PageInfo>,
+    error: Option<String>,
 }
 
 fn decode_b64(data: &str) -> CmdResult<Vec<u8>> {
@@ -81,15 +91,82 @@ async fn doc_delete(state: tauri::State<'_, AppState>, doc_id: String) -> CmdRes
 /// 导入一页（图片以 base64 传输）。耗时操作放到阻塞线程池。
 #[tauri::command]
 async fn page_import(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     doc_id: String,
     data: String,
 ) -> CmdResult<PageInfo> {
-    let bytes = decode_b64(&data)?;
     let store = state.store.clone();
-    tauri::async_runtime::spawn_blocking(move || store.add_page(&doc_id, &bytes).map_err(err_str))
+    let import_doc_id = doc_id.clone();
+    let bytes = data;
+    let page = tauri::async_runtime::spawn_blocking(move || {
+        let decode_start = Instant::now();
+        let bytes = decode_b64(&bytes)?;
+        let decode_ms = decode_start.elapsed().as_millis();
+        eprintln!(
+            "[ScanKing timing] base64_decode doc={} bytes={} elapsed={}ms",
+            import_doc_id,
+            bytes.len(),
+            decode_ms
+        );
+        store.add_page_pending(&import_doc_id, &bytes).map_err(err_str)
+    })
+    .await
+    .map_err(err_str)??;
+
+    let worker_store = state.store.clone();
+    let processing_lock = state.page_processing.clone();
+    let worker_app = app.clone();
+    let worker_doc_id = doc_id.clone();
+    let worker_page_id = page.meta.id.clone();
+    tauri::async_runtime::spawn(async move {
+        let process_store = worker_store.clone();
+        let process_doc_id = worker_doc_id.clone();
+        let process_page_id = worker_page_id.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let _guard = processing_lock
+                .lock()
+                .map_err(|error| format!("页面处理锁失败: {error}"))?;
+            match process_store.process_pending_page(&process_doc_id, &process_page_id) {
+                Ok(page) => Ok((Some(page), None)),
+                Err(error) => {
+                    let message = err_str(error);
+                    if let Err(mark_error) = process_store
+                        .mark_page_processing_failed(&process_doc_id, &process_page_id)
+                    {
+                        eprintln!("无法标记页面处理失败: {mark_error}");
+                    }
+                    let page = process_store
+                        .page_info(&process_doc_id, &process_page_id)
+                        .ok();
+                    Ok((page, Some(message)))
+                }
+            }
+        })
         .await
-        .map_err(err_str)?
+        .map_err(err_str)
+        .and_then(|result| result);
+
+        let event = match result {
+            Ok((page, error)) => PageProcessingEvent {
+                doc_id: worker_doc_id,
+                page_id: worker_page_id,
+                page,
+                error,
+            },
+            Err(error) => PageProcessingEvent {
+                doc_id: worker_doc_id,
+                page_id: worker_page_id,
+                page: None,
+                error: Some(error),
+            },
+        };
+        if let Err(error) = worker_app.emit("scan-page-processed", event) {
+            eprintln!("无法发送页面处理完成事件: {error}");
+        }
+    });
+
+    Ok(page)
 }
 
 #[tauri::command]
@@ -471,6 +548,7 @@ pub fn run() {
             let store = Store::open(&root)?;
             app.manage(AppState {
                 store: Arc::new(store),
+                page_processing: Arc::new(Mutex::new(())),
                 #[cfg(feature = "ocr")]
                 ocr: Mutex::new(None),
             });

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_IMPORT_SIDE: u32 = 3200;
 const PREVIEW_SIDE: u32 = 1600;
@@ -42,6 +42,10 @@ pub struct PageMeta {
     pub height: u32,
     #[serde(default)]
     pub ocr_done: bool,
+    #[serde(default)]
+    pub processing: bool,
+    #[serde(default)]
+    pub detection_confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +83,39 @@ pub struct PageInfo {
     pub quad: [[f32; 2]; 4],
     /// preview 相对原图的缩放比
     pub preview_scale: f32,
+    /// 自动边框检测状态：1 表示找到候选边框，0 表示回退到整图
+    pub detection_confidence: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_timings_ms: Option<PageSaveTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_timings_ms: Option<PageProcessingTimings>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PageSaveTimings {
+    pub raw_write: u64,
+    pub decode: u64,
+    pub orientation_and_rgb: u64,
+    pub resize: u64,
+    pub original_encode_and_write: u64,
+    pub preview: u64,
+    pub work_copy: u64,
+    pub thumbnail: u64,
+    pub metadata: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PageProcessingTimings {
+    pub original_decode: u64,
+    pub orientation_and_rgb: u64,
+    pub resize: u64,
+    pub original_encode_and_write: u64,
+    pub edge_detection: u64,
+    pub preview: u64,
+    pub warp_filter_thumbnail: u64,
+    pub metadata: u64,
+    pub total: u64,
 }
 
 pub struct Store {
@@ -94,11 +131,16 @@ fn new_id() -> String {
 }
 
 fn save_jpeg(img: &RgbImage, path: &Path, quality: u8) -> Result<()> {
+    let out = encode_jpeg(img, quality)?;
+    fs::write(path, out).with_context(|| format!("写入失败: {}", path.display()))?;
+    Ok(())
+}
+
+fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
     enc.encode_image(img).context("JPEG 编码失败")?;
-    fs::write(path, out).with_context(|| format!("写入失败: {}", path.display()))?;
-    Ok(())
+    Ok(out)
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -110,14 +152,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// 按 EXIF Orientation 转正图像
 fn apply_exif_orientation(img: DynamicImage, bytes: &[u8]) -> DynamicImage {
-    let orientation = exif::Reader::new()
-        .read_from_container(&mut Cursor::new(bytes))
-        .ok()
-        .and_then(|e| {
-            e.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-                .and_then(|f| f.value.get_uint(0))
-        })
-        .unwrap_or(1);
+    let orientation = exif_orientation(bytes);
     match orientation {
         2 => DynamicImage::ImageRgba8(imageops::flip_horizontal(&img)),
         3 => DynamicImage::ImageRgba8(imageops::rotate180(&img)),
@@ -134,6 +169,24 @@ fn apply_exif_orientation(img: DynamicImage, bytes: &[u8]) -> DynamicImage {
         8 => DynamicImage::ImageRgba8(imageops::rotate270(&img)),
         _ => img,
     }
+}
+
+fn exif_orientation(bytes: &[u8]) -> u32 {
+    exif::Reader::new()
+        .read_from_container(&mut Cursor::new(bytes))
+        .ok()
+        .and_then(|e| {
+            e.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                .and_then(|f| f.value.get_uint(0))
+        })
+        .unwrap_or(1)
+}
+
+fn source_image_path(page_dir: &Path) -> Option<PathBuf> {
+    ["source.jpg", "source.png"]
+        .iter()
+        .map(|name| page_dir.join(name))
+        .find(|path| path.exists())
 }
 
 impl Store {
@@ -204,7 +257,20 @@ impl Store {
             let Ok(data) = fs::read(&meta_path) else { continue };
             let Ok(doc) = serde_json::from_slice::<DocMeta>(&data) else { continue };
             let cover = doc.pages.first().map(|p| {
-                self.page_dir(&doc.id, &p.id).join("thumb.jpg").to_string_lossy().to_string()
+                let page_dir = self.page_dir(&doc.id, &p.id);
+                let thumb_path = page_dir.join("thumb.jpg");
+                if thumb_path.exists() {
+                    thumb_path
+                } else {
+                    let original_path = page_dir.join("orig.jpg");
+                    if original_path.exists() {
+                        original_path
+                    } else {
+                        source_image_path(&page_dir).unwrap_or(original_path)
+                    }
+                }
+                .to_string_lossy()
+                .to_string()
             });
             out.push(DocSummary {
                 id: doc.id,
@@ -276,51 +342,220 @@ impl Store {
 
     // ---------- 页面处理 ----------
 
-    /// 导入一页：解码 → EXIF 转正 → 限分辨率 → 保存原图/预览 → 自动检测四角 → 矫正+滤镜
+    /// 同步导入一页，供非交互调用和测试使用。
     pub fn add_page(&self, doc_id: &str, bytes: &[u8]) -> Result<PageInfo> {
-        let img = image::load_from_memory(bytes).context("无法解码图片")?;
-        let img = apply_exif_orientation(img, bytes);
-        let mut rgb = img.to_rgb8();
-        let (w, h) = (rgb.width(), rgb.height());
-        if w.max(h) > MAX_IMPORT_SIDE {
-            let s = MAX_IMPORT_SIDE as f32 / w.max(h) as f32;
-            rgb = imageops::resize(
-                &rgb,
-                (w as f32 * s) as u32,
-                (h as f32 * s) as u32,
-                imageops::FilterType::CatmullRom,
-            );
-        }
+        let pending = self.add_page_pending(doc_id, bytes)?;
+        self.process_pending_page(doc_id, &pending.meta.id)
+    }
+
+    /// 快速保存原图，耗时检测与派生图生成留给后台任务。
+    pub fn add_page_pending(&self, doc_id: &str, bytes: &[u8]) -> Result<PageInfo> {
+        let total_start = Instant::now();
+        let format = image::guess_format(bytes).context("无法识别图片格式")?;
+        let extension = match format {
+            image::ImageFormat::Jpeg => "jpg",
+            image::ImageFormat::Png => "png",
+            _ => bail!("不支持的图片格式"),
+        };
+        let (raw_width, raw_height) = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .context("无法读取图片尺寸")?
+            .into_dimensions()
+            .context("无法读取图片尺寸")?;
+        let orientation = exif_orientation(bytes);
+        let (width, height) = if (5..=8).contains(&orientation) {
+            (raw_height, raw_width)
+        } else {
+            (raw_width, raw_height)
+        };
 
         let mut doc = self.load_doc(doc_id)?;
         let page_id = new_id();
         let pdir = self.page_dir(doc_id, &page_id);
         fs::create_dir_all(&pdir)?;
 
-        save_jpeg(&rgb, &pdir.join("orig.jpg"), JPEG_Q_ORIG)?;
-        let preview = shrink(&rgb, PREVIEW_SIDE);
-        save_jpeg(&preview, &pdir.join("preview.jpg"), 82)?;
+        let stage_start = Instant::now();
+        let source_path = pdir.join(format!("source.{extension}"));
+        fs::write(&source_path, bytes)
+            .with_context(|| format!("写入失败: {}", source_path.display()))?;
+        let raw_write_ms = stage_start.elapsed().as_millis();
 
-        let quad = detect::detect_quad(&rgb);
+        let stage_start = Instant::now();
         let meta = PageMeta {
             id: page_id.clone(),
-            // 默认保持原色，用户可自行选"增强"等滤镜
             filter: "original".into(),
-            quad: Some(quad),
+            quad: None,
             rotation: 0,
-            width: rgb.width(),
-            height: rgb.height(),
+            width,
+            height,
             ocr_done: false,
+            processing: true,
+            detection_confidence: None,
         };
         doc.pages.push(meta.clone());
         self.save_doc(&mut doc)?;
+        let metadata_ms = stage_start.elapsed().as_millis();
 
-        self.reprocess(doc_id, &page_id, true)?;
-        self.page_info(doc_id, &page_id)
+        let mut info = self.page_info(doc_id, &page_id)?;
+        info.save_timings_ms = Some(PageSaveTimings {
+            raw_write: raw_write_ms as u64,
+            decode: 0,
+            orientation_and_rgb: 0,
+            resize: 0,
+            original_encode_and_write: 0,
+            preview: 0,
+            work_copy: 0,
+            thumbnail: 0,
+            metadata: metadata_ms as u64,
+            total: total_start.elapsed().as_millis() as u64,
+        });
+        eprintln!(
+            "[ScanKing timing] save doc={} page={} bytes={} image={}x{} raw_write={}ms metadata={}ms total={}ms",
+            doc_id,
+            page_id,
+            bytes.len(),
+            width,
+            height,
+            raw_write_ms,
+            metadata_ms,
+            total_start.elapsed().as_millis()
+        );
+        Ok(info)
+    }
+
+    pub fn process_pending_page(&self, doc_id: &str, page_id: &str) -> Result<PageInfo> {
+        let total_start = Instant::now();
+        let page_dir = self.page_dir(doc_id, page_id);
+        let orig_path = page_dir.join("orig.jpg");
+        let (original, decode_ms, orientation_rgb_ms, resize_ms, original_save_ms) =
+            if let Some(source_path) = source_image_path(&page_dir) {
+                let stage_start = Instant::now();
+                let bytes = fs::read(&source_path)
+                    .with_context(|| format!("原图丢失: {}", source_path.display()))?;
+                let decoded = image::load_from_memory(&bytes).context("无法解码图片")?;
+                let decode_ms = stage_start.elapsed().as_millis();
+
+                let stage_start = Instant::now();
+                let mut original = apply_exif_orientation(decoded, &bytes).to_rgb8();
+                let orientation_rgb_ms = stage_start.elapsed().as_millis();
+
+                let stage_start = Instant::now();
+                if original.width().max(original.height()) > MAX_IMPORT_SIDE {
+                    let scale = MAX_IMPORT_SIDE as f32
+                        / original.width().max(original.height()) as f32;
+                    original = imageops::resize(
+                        &original,
+                        (original.width() as f32 * scale) as u32,
+                        (original.height() as f32 * scale) as u32,
+                        imageops::FilterType::Triangle,
+                    );
+                }
+                let resize_ms = stage_start.elapsed().as_millis();
+
+                let stage_start = Instant::now();
+                let encoded = encode_jpeg(&original, JPEG_Q_ORIG)?;
+                fs::write(&orig_path, encoded)
+                    .with_context(|| format!("写入失败: {}", orig_path.display()))?;
+                let original_save_ms = stage_start.elapsed().as_millis();
+                fs::remove_file(&source_path)
+                    .with_context(|| format!("删除临时原图失败: {}", source_path.display()))?;
+                (original, decode_ms, orientation_rgb_ms, resize_ms, original_save_ms)
+            } else {
+                let stage_start = Instant::now();
+                let original = image::open(&orig_path)
+                    .with_context(|| format!("原图丢失: {}", orig_path.display()))?
+                    .to_rgb8();
+                (original, stage_start.elapsed().as_millis(), 0, 0, 0)
+            };
+        let stage_start = Instant::now();
+        let detection = detect::detect_quad_with_confidence(&original);
+        let detection_ms = stage_start.elapsed().as_millis();
+
+        let stage_start = Instant::now();
+        let mut doc = self.load_doc(doc_id)?;
+        let meta = doc
+            .pages
+            .iter_mut()
+            .find(|page| page.id == page_id)
+            .ok_or_else(|| anyhow!("待处理页面已不存在"))?;
+        if !meta.processing {
+            return self.page_info(doc_id, page_id);
+        }
+        meta.width = original.width();
+        meta.height = original.height();
+        meta.quad = Some(detection.quad);
+        meta.detection_confidence = Some(detection.confidence);
+        self.save_doc(&mut doc)?;
+        let metadata_ms = stage_start.elapsed().as_millis();
+
+        let stage_start = Instant::now();
+        let preview = shrink(&original, PREVIEW_SIDE);
+        save_jpeg(&preview, &self.page_dir(doc_id, page_id).join("preview.jpg"), 82)?;
+        let preview_ms = stage_start.elapsed().as_millis();
+
+        let stage_start = Instant::now();
+        self.reprocess_with_original(doc_id, page_id, true, Some(original))?;
+        let warp_filter_ms = stage_start.elapsed().as_millis();
+
+        let mut doc = self.load_doc(doc_id)?;
+        let meta = doc
+            .pages
+            .iter_mut()
+            .find(|page| page.id == page_id)
+            .ok_or_else(|| anyhow!("待处理页面已不存在"))?;
+        meta.processing = false;
+        self.save_doc(&mut doc)?;
+        let mut info = self.page_info(doc_id, page_id)?;
+        info.processing_timings_ms = Some(PageProcessingTimings {
+            original_decode: decode_ms as u64,
+            orientation_and_rgb: orientation_rgb_ms as u64,
+            resize: resize_ms as u64,
+            original_encode_and_write: original_save_ms as u64,
+            edge_detection: detection_ms as u64,
+            preview: preview_ms as u64,
+            warp_filter_thumbnail: warp_filter_ms as u64,
+            metadata: metadata_ms as u64,
+            total: total_start.elapsed().as_millis() as u64,
+        });
+        eprintln!(
+            "[ScanKing timing] process doc={} page={} decode={}ms exif_rgb={}ms resize={}ms original_encode_write={}ms detect={}ms metadata={}ms preview={}ms warp_filter_thumb={}ms total={}ms",
+            doc_id,
+            page_id,
+            decode_ms,
+            orientation_rgb_ms,
+            resize_ms,
+            original_save_ms,
+            detection_ms,
+            metadata_ms,
+            preview_ms,
+            warp_filter_ms,
+            total_start.elapsed().as_millis()
+        );
+        Ok(info)
+    }
+
+    pub fn mark_page_processing_failed(&self, doc_id: &str, page_id: &str) -> Result<()> {
+        let mut doc = self.load_doc(doc_id)?;
+        if let Some(meta) = doc.pages.iter_mut().find(|page| page.id == page_id) {
+            meta.processing = false;
+            meta.detection_confidence = Some(0.0);
+            self.save_doc(&mut doc)?;
+        }
+        Ok(())
     }
 
     /// 重新执行 矫正(可选) → 旋转 → 滤镜 管线
     fn reprocess(&self, doc_id: &str, page_id: &str, rewarp: bool) -> Result<()> {
+        self.reprocess_with_original(doc_id, page_id, rewarp, None)
+    }
+
+    fn reprocess_with_original(
+        &self,
+        doc_id: &str,
+        page_id: &str,
+        rewarp: bool,
+        original: Option<RgbImage>,
+    ) -> Result<()> {
         let doc = self.load_doc(doc_id)?;
         let meta = doc
             .pages
@@ -332,7 +567,12 @@ impl Store {
 
         let warped_path = pdir.join("warped.jpg");
         let warped: RgbImage = if rewarp || !warped_path.exists() {
-            let orig = image::open(pdir.join("orig.jpg")).context("原图丢失")?.to_rgb8();
+            let orig = match original {
+                Some(image) => image,
+                None => image::open(pdir.join("orig.jpg"))
+                    .context("原图丢失")?
+                    .to_rgb8(),
+            };
             let w = match meta.quad {
                 Some(q) => {
                     let quad: [Pt; 4] = [q[0], q[1], q[2], q[3]];
@@ -368,20 +608,35 @@ impl Store {
             .ok_or_else(|| anyhow!("页面不存在"))?
             .clone();
         let pdir = self.page_dir(doc_id, page_id);
-        let (ww, wh) = image::image_dimensions(pdir.join("work.jpg")).unwrap_or((0, 0));
+        let original_path = pdir.join("orig.jpg");
+        let displayed_original = if original_path.exists() {
+            original_path.clone()
+        } else {
+            source_image_path(&pdir).unwrap_or(original_path)
+        };
+        let preview_path = pdir.join("preview.jpg");
+        let work_path = pdir.join("work.jpg");
+        let thumb_path = pdir.join("thumb.jpg");
+        let displayed_preview = if preview_path.exists() { preview_path } else { displayed_original.clone() };
+        let displayed_work = if work_path.exists() { work_path } else { displayed_original.clone() };
+        let displayed_thumb = if thumb_path.exists() { thumb_path } else { displayed_original.clone() };
+        let (ww, wh) = image::image_dimensions(&displayed_work).unwrap_or((0, 0));
         let quad = meta.quad.unwrap_or_else(|| detect::full_quad(meta.width, meta.height));
         let preview_scale = {
-            let (pw, _) = image::image_dimensions(pdir.join("preview.jpg")).unwrap_or((meta.width, meta.height));
+            let (pw, _) = image::image_dimensions(&displayed_preview).unwrap_or((meta.width, meta.height));
             pw as f32 / meta.width as f32
         };
         Ok(PageInfo {
-            preview: pdir.join("preview.jpg").to_string_lossy().to_string(),
-            work: pdir.join("work.jpg").to_string_lossy().to_string(),
-            thumb: pdir.join("thumb.jpg").to_string_lossy().to_string(),
+            preview: displayed_preview.to_string_lossy().to_string(),
+            work: displayed_work.to_string_lossy().to_string(),
+            thumb: displayed_thumb.to_string_lossy().to_string(),
             work_width: ww,
             work_height: wh,
             quad,
             preview_scale,
+            detection_confidence: meta.detection_confidence,
+            save_timings_ms: None,
+            processing_timings_ms: None,
             meta,
         })
     }
@@ -566,6 +821,8 @@ impl Store {
             width: composed.width(),
             height: composed.height(),
             ocr_done: false,
+            processing: false,
+            detection_confidence: None,
         };
         doc.pages.push(meta);
         self.save_doc(&mut doc)?;

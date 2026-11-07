@@ -12,6 +12,16 @@ const DETECT_SIZE: u32 = 600;
 /// 检测图中最像"一页文档"的四边形，返回原图坐标系下的四角（左上/右上/右下/左下）。
 /// 检测不到时返回整幅图像的四角。
 pub fn detect_quad(img: &RgbImage) -> [Pt; 4] {
+    detect_quad_with_confidence(img).quad
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QuadDetection {
+    pub quad: [Pt; 4],
+    pub confidence: f32,
+}
+
+pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
     let (ow, oh) = (img.width(), img.height());
     let scale = (DETECT_SIZE as f32 / ow.max(oh) as f32).min(1.0);
     let (sw, sh) = (
@@ -22,7 +32,6 @@ pub fn detect_quad(img: &RgbImage) -> [Pt; 4] {
     let gray = imageops::grayscale(&small);
     let blurred = imageproc::filter::gaussian_blur_f32(&gray, 1.4);
 
-    // 用中位数自适应 Canny 阈值
     let med = median(&blurred) as f32;
     let lo = (0.55 * med).clamp(8.0, 120.0);
     let hi = (1.35 * med).clamp(30.0, 240.0);
@@ -34,7 +43,7 @@ pub fn detect_quad(img: &RgbImage) -> [Pt; 4] {
         best = try_contours(&edges, sw, sh);
     }
 
-    match best {
+    let (quad, confidence) = match best {
         Some(q) => {
             let inv = 1.0 / scale;
             let mut out = q;
@@ -42,10 +51,11 @@ pub fn detect_quad(img: &RgbImage) -> [Pt; 4] {
                 p[0] = (p[0] * inv).clamp(0.0, ow as f32 - 1.0);
                 p[1] = (p[1] * inv).clamp(0.0, oh as f32 - 1.0);
             }
-            out
+            (out, 1.0)
         }
-        None => full_quad(ow, oh),
-    }
+        None => (full_quad(ow, oh), 0.0),
+    };
+    QuadDetection { quad, confidence }
 }
 
 pub fn full_quad(w: u32, h: u32) -> [Pt; 4] {
@@ -95,7 +105,7 @@ fn try_contours(edges: &GrayImage, sw: u32, sh: u32) -> Option<[Pt; 4]> {
             _ => best = Some((quad, qa)),
         }
     }
-    best.map(|(q, _)| q)
+    best.map(|(quad, _)| quad)
 }
 
 fn median(g: &GrayImage) -> u8 {

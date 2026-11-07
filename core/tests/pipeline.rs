@@ -78,6 +78,59 @@ fn test_detect_quad_accuracy() {
 }
 
 #[test]
+fn test_pending_import_finishes_in_background_stage() {
+    let root = std::env::temp_dir().join(format!("sk_pending_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = Store::open(&root).unwrap();
+    let doc = store.create_doc("异步处理").unwrap();
+    let (img, _) = synth_photo();
+
+    let pending = store.add_page_pending(&doc.id, &jpeg_bytes(&img)).unwrap();
+    assert!(pending.meta.processing);
+    assert!(std::path::Path::new(&pending.thumb).exists());
+    assert!(std::path::Path::new(&pending.work).exists());
+    assert_eq!(
+        std::path::Path::new(&pending.preview).file_name().unwrap(),
+        "source.jpg"
+    );
+    assert_eq!(pending.thumb, pending.work);
+    let page_dir = std::path::Path::new(&pending.work).parent().unwrap();
+    assert!(!page_dir.join("preview.jpg").exists());
+    assert!(!page_dir.join("orig.jpg").exists());
+    assert!(!page_dir.join("work.jpg").exists());
+    assert!(!page_dir.join("thumb.jpg").exists());
+    let cover = store.list_docs().unwrap()[0].cover.clone().unwrap();
+    assert!(std::path::Path::new(&cover).exists());
+
+    let completed = store.process_pending_page(&doc.id, &pending.meta.id).unwrap();
+    assert!(!completed.meta.processing);
+    assert_eq!(completed.detection_confidence, Some(1.0));
+    assert_ne!(completed.thumb, completed.work);
+    assert!(std::path::Path::new(&completed.preview).exists());
+    assert!(std::path::Path::new(&completed.thumb).exists());
+    assert!(page_dir.join("orig.jpg").exists());
+    assert!(!page_dir.join("source.jpg").exists());
+    assert!(completed.quad.iter().any(|point| point[0] != 0.0 || point[1] != 0.0));
+
+    let png_doc = store.create_doc("PNG 导入").unwrap();
+    let mut png_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut png_bytes, image::ImageFormat::Png)
+        .unwrap();
+    let png_pending = store.add_page_pending(&png_doc.id, png_bytes.get_ref()).unwrap();
+    assert!(png_pending.preview.ends_with("source.png"));
+    let png_completed = store
+        .process_pending_page(&png_doc.id, &png_pending.meta.id)
+        .unwrap();
+    assert!(!png_completed.meta.processing);
+    assert!(std::path::Path::new(&png_completed.preview).exists());
+
+    store.delete_doc(&doc.id).unwrap();
+    store.delete_doc(&png_doc.id).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_warp_produces_upright_page() {
     let (img, truth) = synth_photo();
     let warped = warp_quad(&img, order_quad(truth));
@@ -121,6 +174,12 @@ fn test_store_full_workflow() {
     let bytes = jpeg_bytes(&img);
     let p1 = store.add_page(&doc.id, &bytes).unwrap();
     let p2 = store.add_page(&doc.id, &bytes).unwrap();
+    assert!(p1.detection_confidence.is_some());
+    assert_eq!(
+        p1.quad,
+        store.detect_page(&doc.id, &p1.meta.id).unwrap(),
+        "首次导入检测应与编辑器重新检测使用相同原图并得到相同边框"
+    );
     assert!(std::path::Path::new(&p1.work).exists());
     assert!(std::path::Path::new(&p1.thumb).exists());
     assert!(p1.work_width > 0);

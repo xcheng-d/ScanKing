@@ -220,6 +220,12 @@ window.addEventListener("popstate", async (event) => {
     return;
   }
 
+  if (activeView === "view-capture" && appView !== "view-capture" && captureImportInProgress) {
+    toast("照片仍在保存，请稍候");
+    history.forward();
+    return;
+  }
+
   if (!pendingBackTarget && activeView === "view-capture" && appView !== "view-capture" &&
       captureReturnView && appView !== captureReturnView) {
     pendingBackTarget = captureReturnView;
@@ -372,20 +378,71 @@ async function refreshDoc() {
   currentDoc.pages.forEach((p, i) => {
     const cell = document.createElement("div");
     cell.className = "page-cell";
+    cell.dataset.pageId = p.meta.id;
     const selIdx = selected.indexOf(p.meta.id);
     if (selIdx >= 0) cell.classList.add("selected");
     cell.innerHTML = `
       <img src="${src(p.thumb, bust)}" loading="lazy" />
       <span class="pnum">${i + 1}</span>
+      ${p.meta.processing ? `<span class="processing-mark">处理中</span>` : ""}
       ${selIdx >= 0 ? `<span class="sel-badge">${selIdx + 1}</span>` : p.meta.ocr_done ? `<span class="ocr-mark">已识别</span>` : ""}`;
     attachPress(
       cell,
-      () => (selectMode ? toggleSelect(p.meta.id) : openPage(i)),
-      () => pageMenu(i)
+      () => p.meta.processing ? toast("页面仍在处理中，请稍候") : (selectMode ? toggleSelect(p.meta.id) : openPage(i)),
+      () => p.meta.processing ? toast("页面仍在处理中，请稍候") : pageMenu(i)
     );
     grid.appendChild(cell);
   });
 }
+
+function updateProcessedPage(payload) {
+  const { doc_id: docId, page_id: pageId, page, error } = payload;
+  const pageKey = `${docId}:${pageId}`;
+  if (currentDocId === docId && currentDoc && page) {
+    const index = currentDoc.pages.findIndex((item) => item.meta.id === pageId);
+    if (index >= 0) currentDoc.pages[index] = page;
+    else processedPageUpdates.set(pageKey, payload);
+    const image = document.querySelector(`#page-grid [data-page-id="${pageId}"] img`);
+    if (image) image.src = src(page.thumb, Date.now());
+    const cell = document.querySelector(`#page-grid [data-page-id="${pageId}"]`);
+    if (cell) {
+      cell.querySelector(".processing-mark")?.remove();
+      if (page.meta.processing) {
+        const status = document.createElement("span");
+        status.className = "processing-mark";
+        status.textContent = "处理中";
+        cell.appendChild(status);
+      }
+    }
+    if (document.querySelector(".view.active")?.id === "view-page" &&
+        currentDoc.pages[currentPageIdx]?.meta.id === pageId && !page.meta.processing) {
+      $("page-img").src = src(page.work, Date.now());
+    }
+  }
+  const queueThumb = document.querySelector(`#queue-strip [data-page-id="${pageId}"] img`);
+  if (queueThumb && page) queueThumb.src = src(page.thumb, Date.now());
+  if (error) {
+    console.error(`页面后台处理失败 (${docId}/${pageId}):`, error);
+    if (currentDocId === docId) toast("照片已保存，但后台处理失败：" + error, 5000);
+  } else if (page?.detection_confidence !== null && page?.detection_confidence < 0.45 &&
+             currentDocId === docId) {
+    toast("未检测到纸张边框，已按整图处理；请检查并手动调整裁剪框", 4200);
+  }
+}
+
+const processedPageUpdates = new Map();
+const pageProcessingListener = window.__TAURI__.event.listen("scan-page-processed", ({ payload }) => {
+  if (payload.page?.processing_timings_ms) {
+    console.info("[ScanKing timing] background_processing", {
+      doc_id: payload.doc_id,
+      page_id: payload.page_id,
+      ...payload.page.processing_timings_ms,
+    });
+  }
+  updateProcessedPage(payload);
+});
+pageProcessingListener.catch((error) => console.error("无法监听页面处理事件：", error));
+
 $("btn-doc-back").onclick = () => backTo("view-library");
 $("doc-title").addEventListener("change", async (e) => {
   await call("doc_rename", { docId: currentDocId, title: e.target.value });
@@ -565,6 +622,8 @@ let camStream = null;
 let importedInSession = 0;
 let captureStartPageCount = 0;
 let captureCreatedDoc = false;
+let captureImportInProgress = false;
+let fileImportBatchActive = false;
 
 $("btn-new-scan").onclick = async () => {
   const doc = await call("doc_create", { title: "" });
@@ -616,6 +675,10 @@ function stopCam() {
   $("cam-video").srcObject = null;
 }
 async function finishCapture() {
+  if (captureImportInProgress) {
+    toast("照片仍在保存，请稍候");
+    return;
+  }
   stopCam();
   if (captureCreatedDoc && currentDoc?.pages.length === 0) {
     try {
@@ -651,49 +714,116 @@ async function discardEmptyNewCapture() {
 $("btn-cam-close").onclick = finishCapture;
 $("btn-cam-done").onclick = finishCapture;
 
+$("btn-shutter").disabled = false;
 $("btn-shutter").onclick = async () => {
-  const v = $("cam-video");
-  if (!camStream || !v.videoWidth) return toast("相机未就绪，试试相册导入");
-  const c = document.createElement("canvas");
-  c.width = v.videoWidth;
-  c.height = v.videoHeight;
-  c.getContext("2d").drawImage(v, 0, 0);
-  const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.93));
-  await importBlob(blob);
+ const shutter = $("btn-shutter");
+ if (shutter.disabled) return;
+ shutter.disabled = true;
+ const captureStart = performance.now();
+ const timings = {};
+ try {
+   let photo = null;
+   const track = camStream?.getVideoTracks()[0];
+   if (track && typeof ImageCapture !== "undefined") {
+     const photoStart = performance.now();
+     try {
+       photo = await new ImageCapture(track).takePhoto();
+       timings.camera_photo_ms = Math.round(performance.now() - photoStart);
+     } catch (error) {
+       timings.camera_photo_ms = Math.round(performance.now() - photoStart);
+       console.warn("原生相机拍照不可用，改用预览帧：", error);
+     }
+   }
+
+   if (photo) {
+     timings.photo_bytes = photo.size;
+     await importBlob(photo, timings, captureStart);
+     return;
+   }
+
+   const v = $("cam-video");
+   if (!camStream || !v.videoWidth) return toast("相机未就绪，试试相册导入");
+   const c = document.createElement("canvas");
+   c.width = v.videoWidth;
+   c.height = v.videoHeight;
+   c.getContext("2d").drawImage(v, 0, 0);
+   const encodeStart = performance.now();
+   const blob = await new Promise((resolve, reject) => {
+     c.toBlob((result) => result ? resolve(result) : reject(new Error("无法生成拍摄图像")), "image/jpeg", 0.93);
+   });
+   timings.video_frame_encode_ms = Math.round(performance.now() - encodeStart);
+   timings.photo_bytes = blob.size;
+   await importBlob(blob, timings, captureStart);
+ } catch (error) {
+   console.error("拍摄或导入照片失败：", error);
+   toast("拍摄或导入照片失败：" + error);
+ } finally {
+   shutter.disabled = false;
+ }
 };
 $("btn-gallery").onclick = () => $("file-gallery").click();
 $("btn-fallback-gallery").onclick = () => $("file-gallery").click();
 $("btn-native-cam").onclick = () => $("file-camera").click();
-$("file-gallery").addEventListener("change", async (e) => {
-  for (const f of e.target.files) await importBlob(f);
-  e.target.value = "";
-});
-$("file-camera").addEventListener("change", async (e) => {
-  for (const f of e.target.files) await importBlob(f);
-  e.target.value = "";
-});
+$("file-gallery").addEventListener("change", (e) => importFiles(e.target));
+$("file-camera").addEventListener("change", (e) => importFiles(e.target));
 
-async function importBlob(blob) {
-  loading(true, "正在检测边缘并矫正…");
+async function importFiles(input) {
+  if (fileImportBatchActive || captureImportInProgress) {
+    input.value = "";
+    return;
+  }
+  fileImportBatchActive = true;
   try {
+    for (const file of input.files) await importBlob(file);
+  } finally {
+    input.value = "";
+    fileImportBatchActive = false;
+  }
+}
+
+async function importBlob(blob, timings = {}, captureStart = performance.now()) {
+  if (captureImportInProgress) return;
+  captureImportInProgress = true;
+  loading(true, "正在保存照片…");
+  try {
+    let stageStart = performance.now();
+    await pageProcessingListener;
+    timings.event_listener_ready_ms = Math.round(performance.now() - stageStart);
+    stageStart = performance.now();
     const data = await blobToB64(blob);
+    timings.base64_ms = Math.round(performance.now() - stageStart);
+    timings.base64_chars = data.length;
+    stageStart = performance.now();
     const info = await call("page_import", { docId: currentDocId, data });
+    timings.save_invoke_ms = Math.round(performance.now() - stageStart);
+    timings.backend_save = info.save_timings_ms || null;
     importedInSession++;
     bust = Date.now();
+    stageStart = performance.now();
     const pageIdx = currentDoc.pages.length;
     currentDoc.pages.push(info);
     const thumb = document.createElement("button");
     thumb.className = "queue-thumb";
     thumb.type = "button";
     thumb.dataset.pageIndex = pageIdx;
+    thumb.dataset.pageId = info.meta.id;
     thumb.setAttribute("aria-label", `预览第 ${pageIdx + 1} 页`);
     thumb.innerHTML = `<img src="${src(info.thumb, bust)}" alt="" />`;
     thumb.onclick = () => openPage(Number(thumb.dataset.pageIndex), "view-capture");
     $("queue-strip").appendChild(thumb);
+    const completed = processedPageUpdates.get(`${currentDocId}:${info.meta.id}`);
+    if (completed) {
+      processedPageUpdates.delete(`${currentDocId}:${info.meta.id}`);
+      updateProcessedPage(completed);
+    }
     if ($("queue-strip").children.length > 5) $("queue-strip").removeChild($("queue-strip").firstChild);
     updateQueueCount();
+    timings.update_ui_ms = Math.round(performance.now() - stageStart);
+    timings.total_to_unlock_ms = Math.round(performance.now() - captureStart);
+    console.info("[ScanKing timing] capture_save", timings);
   } finally {
     loading(false);
+    captureImportInProgress = false;
   }
 }
 function updateQueueCount() {
@@ -1078,6 +1208,10 @@ const editorTouchPoints = new Map();
 let editorTouchRotation = null;
 
 async function openEditor(idx) {
+  if (currentDoc.pages[idx]?.meta.processing) {
+    toast("页面仍在处理中，请稍候");
+    return;
+  }
   editorReturnView = document.querySelector(".view.active")?.id || "view-doc";
   show("view-editor");
   await loadEditorPage(idx);

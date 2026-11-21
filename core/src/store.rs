@@ -16,6 +16,7 @@ use crate::filters::{apply_filter, Filter};
 use crate::geometry::{warp_quad, Pt};
 use crate::idcard;
 use crate::pdf::{build_pdf, PageMode, PdfPage};
+use crate::quality;
 use anyhow::{anyhow, bail, Context, Result};
 use image::{imageops, DynamicImage, RgbImage};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,9 @@ pub struct PageMeta {
     pub processing: bool,
     #[serde(default)]
     pub detection_confidence: Option<f32>,
+    /// 清晰度评分（Laplacian 方差），低于 quality::BLURRY_THRESHOLD 提示拍糊
+    #[serde(default)]
+    pub sharpness: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +116,7 @@ pub struct PageProcessingTimings {
     pub resize: u64,
     pub original_encode_and_write: u64,
     pub edge_detection: u64,
+    pub quality_check: u64,
     pub preview: u64,
     pub warp_filter_thumbnail: u64,
     pub metadata: u64,
@@ -391,6 +396,7 @@ impl Store {
             ocr_done: false,
             processing: true,
             detection_confidence: None,
+            sharpness: None,
         };
         doc.pages.push(meta.clone());
         self.save_doc(&mut doc)?;
@@ -471,6 +477,11 @@ impl Store {
         let detection = detect::detect_quad_with_confidence(&original);
         let detection_ms = stage_start.elapsed().as_millis();
 
+        // 失焦门控：拍完立刻评估清晰度，模糊输入提前暴露
+        let stage_start = Instant::now();
+        let sharpness = quality::laplacian_variance(&original);
+        let quality_ms = stage_start.elapsed().as_millis();
+
         let stage_start = Instant::now();
         let mut doc = self.load_doc(doc_id)?;
         let meta = doc
@@ -485,6 +496,7 @@ impl Store {
         meta.height = original.height();
         meta.quad = Some(detection.quad);
         meta.detection_confidence = Some(detection.confidence);
+        meta.sharpness = Some(sharpness);
         self.save_doc(&mut doc)?;
         let metadata_ms = stage_start.elapsed().as_millis();
 
@@ -512,6 +524,7 @@ impl Store {
             resize: resize_ms as u64,
             original_encode_and_write: original_save_ms as u64,
             edge_detection: detection_ms as u64,
+            quality_check: quality_ms as u64,
             preview: preview_ms as u64,
             warp_filter_thumbnail: warp_filter_ms as u64,
             metadata: metadata_ms as u64,
@@ -823,6 +836,7 @@ impl Store {
             ocr_done: false,
             processing: false,
             detection_confidence: None,
+            sharpness: None,
         };
         doc.pages.push(meta);
         self.save_doc(&mut doc)?;

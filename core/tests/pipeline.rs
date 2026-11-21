@@ -155,9 +155,13 @@ fn test_filters_run() {
         assert_eq!((out.width(), out.height()), (warped.width(), warped.height()));
     }
     let bw = apply_filter(&warped, Filter::Bw);
-    for p in bw.pixels() {
-        assert!(p[0] == 0 || p[0] == 255);
-    }
+    // Sauvola 软边界：绝大多数像素接近纯黑白，仅边缘有窄幅灰度过渡
+    let binary = bw.pixels().filter(|p| p[0] <= 16 || p[0] >= 239).count();
+    assert!(
+        binary as f32 > bw.pixels().len() as f32 * 0.95,
+        "黑白输出应接近二值，纯黑白占比不足: {:.3}",
+        binary as f32 / bw.pixels().len() as f32
+    );
     let enh = apply_filter(&warped, Filter::Enhance);
     let center_bg = enh.get_pixel(30, 30);
     assert!(center_bg[0] > 200, "增强后纸面不够亮: {:?}", center_bg);
@@ -175,10 +179,18 @@ fn test_store_full_workflow() {
     let p1 = store.add_page(&doc.id, &bytes).unwrap();
     let p2 = store.add_page(&doc.id, &bytes).unwrap();
     assert!(p1.detection_confidence.is_some());
-    assert_eq!(
-        p1.quad,
-        store.detect_page(&doc.id, &p1.meta.id).unwrap(),
-        "首次导入检测应与编辑器重新检测使用相同原图并得到相同边框"
+    // 角点已做亚像素精化，JPEG 重编码的微小像素差异会带来亚像素级抖动，用容差比较
+    let redetected = store.detect_page(&doc.id, &p1.meta.id).unwrap();
+    let max_diff = p1
+        .quad
+        .iter()
+        .zip(redetected.iter())
+        .map(|(a, b)| (a[0] - b[0]).abs().max((a[1] - b[1]).abs()))
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff < 1.5,
+        "首次导入检测应与编辑器重新检测得到一致边框（偏差 {}px）",
+        max_diff
     );
     assert!(std::path::Path::new(&p1.work).exists());
     assert!(std::path::Path::new(&p1.thumb).exists());

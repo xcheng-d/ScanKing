@@ -427,6 +427,10 @@ function updateProcessedPage(payload) {
   } else if (page?.detection_confidence !== null && page?.detection_confidence < 0.45 &&
              currentDocId === docId) {
     toast("未检测到纸张边框，已按整图处理；请检查并手动调整裁剪框", 4200);
+  } else if (page?.meta?.sharpness != null &&
+             page.meta.sharpness < 80 && // 对应 core/src/quality.rs BLURRY_THRESHOLD
+             currentDocId === docId) {
+    toast("照片可能拍糊了，建议重拍", 4200);
   }
 }
 

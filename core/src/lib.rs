@@ -13,6 +13,7 @@ pub mod filters;
 pub mod geometry;
 pub mod idcard;
 pub mod pdf;
+pub mod quality;
 pub mod store;
 
 #[cfg(feature = "ocr")]

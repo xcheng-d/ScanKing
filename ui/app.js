@@ -1397,9 +1397,17 @@ function drawEditor() {
     ctx.stroke();
   }
   ctx.restore();
-  // 放大镜（仅角点拖拽；-2 为整体移动，无对应角点）
+  // 放大镜：角点拖拽显示对应角点；整边平移（4~7）显示该边实时中点；
+  // -2 为整体移动，无对应锚点
+  let anchor = null;
   if (editor.dragging >= 0 && editor.dragging < 4) {
-    const [x, y] = rotateEditorPoint(...pts[editor.dragging], angle);
+    anchor = pts[editor.dragging];
+  } else if (editor.dragging >= 4) {
+    const a = pts[editor.dragging - 4], b = pts[(editor.dragging - 3) % 4];
+    anchor = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  }
+  if (anchor) {
+    const [x, y] = rotateEditorPoint(...anchor, angle);
     const R = 52 * dpr, Z = 2.4;
     const mx = x < canvas.width / 2 ? canvas.width - R - 14 * dpr : R + 14 * dpr;
     const my = R + 14 * dpr;

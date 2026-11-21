@@ -1376,9 +1376,20 @@ function drawEditor() {
     ctx.lineWidth = 2 * dpr;
     ctx.stroke();
   }
+  // 边中点（仅够长的边）：拖动整边平移
+  for (const m of edgeMidpoints(pts, dpr)) {
+    if (!m.ok) continue;
+    ctx.beginPath();
+    ctx.arc(m.x, m.y, 4.5 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = "#fff";
+    ctx.fill();
+    ctx.strokeStyle = "#3b82f6";
+    ctx.lineWidth = 1.8 * dpr;
+    ctx.stroke();
+  }
   ctx.restore();
-  // 放大镜
-  if (editor.dragging >= 0) {
+  // 放大镜（仅角点拖拽；-2 为整体移动，无对应角点）
+  if (editor.dragging >= 0 && editor.dragging < 4) {
     const [x, y] = rotateEditorPoint(...pts[editor.dragging], angle);
     const R = 52 * dpr, Z = 2.4;
     const mx = x < canvas.width / 2 ? canvas.width - R - 14 * dpr : R + 14 * dpr;
@@ -1445,7 +1456,27 @@ canvas.addEventListener("pointerdown", (e) => {
     if (d < bd) { bd = d; best = i; }
   });
   editor.dragging = best;
-  if (best >= 0) canvas.setPointerCapture(e.pointerId);
+  if (best >= 0) {
+    canvas.setPointerCapture(e.pointerId);
+  } else {
+    const ei = hitEdgeMidpoint(x, y, pts, dpr);
+    if (ei >= 0) {
+      // 边中点：整边移动模式（dragging = 4 + 边号）
+      editor.dragging = 4 + ei;
+      editor.moveStart = c2o(x, y);
+      editor.moveQuad = editor.quad.map((q) => [q[0], q[1]]);
+      const a = editor.quad[ei], b = editor.quad[(ei + 1) % 4];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      editor.moveNormal = [(a[1] - b[1]) / len, (b[0] - a[0]) / len];
+      canvas.setPointerCapture(e.pointerId);
+    } else if (pointInQuad(x, y, pts)) {
+      // 命中四边形内部（非角点/边中点）：整体拖动模式
+      editor.dragging = -2;
+      editor.moveStart = c2o(x, y);
+      editor.moveQuad = editor.quad.map((q) => [q[0], q[1]]);
+      canvas.setPointerCapture(e.pointerId);
+    }
+  }
   drawEditor();
 });
 canvas.addEventListener("pointermove", (e) => {
@@ -1469,6 +1500,61 @@ canvas.addEventListener("pointermove", (e) => {
       return;
     }
   }
+  if (editor.dragging >= 4) {
+    if (editor.stage !== "crop") return;
+    const [x, y] = editorPointerPos(e);
+    const o = c2o(x, y);
+    const eIdx = editor.dragging - 4;
+    const n = editor.moveNormal;
+    // 位移只取法线方向分量：边线沿自身法向平移
+    let amount = (o[0] - editor.moveStart[0]) * n[0] + (o[1] - editor.moveStart[1]) * n[1];
+    const p = editor.page;
+    const a = editor.moveQuad[eIdx], b = editor.moveQuad[(eIdx + 1) % 4];
+    // 钳制位移量：两个动点始终保持在图内
+    let lo = -Infinity, hi = Infinity;
+    for (const pt of [a, b]) {
+      if (n[0] > 1e-6) { lo = Math.max(lo, -pt[0] / n[0]); hi = Math.min(hi, (p.meta.width - 1 - pt[0]) / n[0]); }
+      else if (n[0] < -1e-6) { lo = Math.max(lo, (p.meta.width - 1 - pt[0]) / n[0]); hi = Math.min(hi, -pt[0] / n[0]); }
+      if (n[1] > 1e-6) { lo = Math.max(lo, -pt[1] / n[1]); hi = Math.min(hi, (p.meta.height - 1 - pt[1]) / n[1]); }
+      else if (n[1] < -1e-6) { lo = Math.max(lo, (p.meta.height - 1 - pt[1]) / n[1]); hi = Math.min(hi, -pt[1] / n[1]); }
+    }
+    if (lo <= hi) amount = Math.max(lo, Math.min(hi, amount));
+    const cand = editor.moveQuad.map((q) => [q[0], q[1]]);
+    cand[eIdx] = [a[0] + n[0] * amount, a[1] + n[1] * amount];
+    cand[(eIdx + 1) % 4] = [b[0] + n[0] * amount, b[1] + n[1] * amount];
+    // 极端位移会破坏凸性，停在最后一个有效位置
+    if (quadIsConvex(cand)) editor.quad = cand;
+    drawEditor();
+    return;
+  }
+  if (editor.dragging === -2) {
+    if (editor.stage !== "crop") return;
+    const [x, y] = editorPointerPos(e);
+    const o = c2o(x, y);
+    let dx = o[0] - editor.moveStart[0];
+    let dy = o[1] - editor.moveStart[1];
+    const p = editor.page;
+    const xs = editor.moveQuad.map((q) => q[0] + dx);
+    const ys = editor.moveQuad.map((q) => q[1] + dy);
+    // 越界时整体回退位移量（而非逐点钳制），保持四边形形状不变
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    if (minX < 0) dx -= minX;
+    if (maxX > p.meta.width - 1) dx -= maxX - (p.meta.width - 1);
+    if (minY < 0) dy -= minY;
+    if (maxY > p.meta.height - 1) dy -= maxY - (p.meta.height - 1);
+    editor.quad = editor.moveQuad.map(([qx, qy]) => [qx + dx, qy + dy]);
+    drawEditor();
+    return;
+  }
+  if (editor.dragging < 0 && editor.stage === "crop" && !editorTouchPoints.size) {
+    // 桌面端光标反馈：边中点"抓取"、框内"移动"
+    const [x, y] = editorPointerPos(e);
+    const pts = editor.quad.map(o2c);
+    const dpr = window.devicePixelRatio || 1;
+    canvas.style.cursor = hitEdgeMidpoint(x, y, pts, dpr) >= 0 ? "grab"
+      : pointInQuad(x, y, pts) ? "move" : "";
+  }
   if (editor.dragging < 0 || editor.stage !== "crop") return;
   const [x, y] = editorPointerPos(e);
   const o = c2o(x, y);
@@ -1482,10 +1568,45 @@ function endEditorPointer(e) {
   editorTouchPoints.delete(e.pointerId);
   if (editorTouchPoints.size < 2) editorTouchRotation = null;
   editor.dragging = -1;
+  editor.moveStart = null;
+  editor.moveQuad = null;
+  editor.moveNormal = null;
   drawEditor();
 }
 canvas.addEventListener("pointerup", endEditorPointer);
 canvas.addEventListener("pointercancel", endEditorPointer);
+
+// 边中点拖点的最小边长（画布像素 × dpr）：短边不显示、不可拖
+const EDGE_MID_MIN = 56;
+function edgeMidpoints(pts, dpr) {
+  const mids = [];
+  for (let i = 0; i < 4; i++) {
+    const a = pts[i], b = pts[(i + 1) % 4];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    mids.push({ i, x: (a[0] + b[0]) / 2, y: (a[1] + b[1]) / 2, ok: len >= EDGE_MID_MIN * dpr });
+  }
+  return mids;
+}
+function hitEdgeMidpoint(x, y, pts, dpr) {
+  let best = -1, bd = 30 * dpr;
+  for (const m of edgeMidpoints(pts, dpr)) {
+    if (!m.ok) continue;
+    const d = Math.hypot(m.x - x, m.y - y);
+    if (d < bd) { bd = d; best = m.i; }
+  }
+  return best;
+}
+function pointInQuad(x, y, pts) {
+  // 射线法：顶点顺序任意、非凸也适用
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, yi] = pts[i], [xj, yj] = pts[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
 
 function quadIsConvex(q) {
   let sign = 0;

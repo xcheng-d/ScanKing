@@ -17,6 +17,7 @@ use crate::geometry::{warp_quad, Pt};
 use crate::idcard;
 use crate::pdf::{build_pdf, PageMode, PdfPage};
 use crate::quality;
+use crate::resize::resize_rgb;
 use anyhow::{anyhow, bail, Context, Result};
 use image::{imageops, DynamicImage, RgbImage};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,17 @@ pub struct PageMeta {
     /// 清晰度评分（Laplacian 方差），低于 quality::BLURRY_THRESHOLD 提示拍糊
     #[serde(default)]
     pub sharpness: Option<f32>,
+}
+
+/// 矫正/旋转/滤镜管线的子阶段耗时（ms），仅用于日志定位
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReprocessTimings {
+    pub warp: u128,
+    pub archive_encode: u128,
+    pub rotate: u128,
+    pub filter: u128,
+    pub work_encode: u128,
+    pub thumb: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,15 +149,51 @@ fn new_id() -> String {
 }
 
 fn save_jpeg(img: &RgbImage, path: &Path, quality: u8) -> Result<()> {
-    let out = encode_jpeg(img, quality)?;
+    save_jpeg_with(img, path, quality, jpeg_encoder::SamplingFactor::F_2_2)
+}
+
+/// 高质量归档（原图/矫正缓存）：4:2:2 色度采样，保留彩色内容精度
+fn save_jpeg_photo(img: &RgbImage, path: &Path, quality: u8) -> Result<()> {
+    save_jpeg_with(img, path, quality, jpeg_encoder::SamplingFactor::F_2_1)
+}
+
+fn save_jpeg_with(
+    img: &RgbImage,
+    path: &Path,
+    quality: u8,
+    sf: jpeg_encoder::SamplingFactor,
+) -> Result<()> {
+    let out = encode_jpeg_with(img, quality, sf)?;
     fs::write(path, out).with_context(|| format!("写入失败: {}", path.display()))?;
     Ok(())
 }
 
 fn encode_jpeg(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    encode_jpeg_with(img, quality, jpeg_encoder::SamplingFactor::F_2_2)
+}
+
+fn encode_jpeg_photo(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    encode_jpeg_with(img, quality, jpeg_encoder::SamplingFactor::F_2_1)
+}
+
+/// jpeg-encoder 比 image 自带编码器快约 4 倍（4:2:0）
+fn encode_jpeg_with(
+    img: &RgbImage,
+    quality: u8,
+    sf: jpeg_encoder::SamplingFactor,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
-    enc.encode_image(img).context("JPEG 编码失败")?;
+    {
+        let mut enc = jpeg_encoder::Encoder::new(&mut out, quality);
+        enc.set_sampling_factor(sf);
+        enc.encode(
+            img.as_raw(),
+            img.width() as u16,
+            img.height() as u16,
+            jpeg_encoder::ColorType::Rgb,
+        )
+        .map_err(|e| anyhow!("JPEG 编码失败: {e}"))?;
+    }
     Ok(out)
 }
 
@@ -434,7 +482,7 @@ impl Store {
         let total_start = Instant::now();
         let page_dir = self.page_dir(doc_id, page_id);
         let orig_path = page_dir.join("orig.jpg");
-        let (original, decode_ms, orientation_rgb_ms, resize_ms, original_save_ms) =
+        let (original, decode_ms, orientation_rgb_ms, resize_ms, archive_source) =
             if let Some(source_path) = source_image_path(&page_dir) {
                 let stage_start = Instant::now();
                 let bytes = fs::read(&source_path)
@@ -450,38 +498,70 @@ impl Store {
                 if original.width().max(original.height()) > MAX_IMPORT_SIDE {
                     let scale = MAX_IMPORT_SIDE as f32
                         / original.width().max(original.height()) as f32;
-                    original = imageops::resize(
+                    original = resize_rgb(
                         &original,
                         (original.width() as f32 * scale) as u32,
                         (original.height() as f32 * scale) as u32,
-                        imageops::FilterType::Triangle,
                     );
                 }
                 let resize_ms = stage_start.elapsed().as_millis();
 
-                let stage_start = Instant::now();
-                let encoded = encode_jpeg(&original, JPEG_Q_ORIG)?;
-                fs::write(&orig_path, encoded)
-                    .with_context(|| format!("写入失败: {}", orig_path.display()))?;
-                let original_save_ms = stage_start.elapsed().as_millis();
-                fs::remove_file(&source_path)
-                    .with_context(|| format!("删除临时原图失败: {}", source_path.display()))?;
-                (original, decode_ms, orientation_rgb_ms, resize_ms, original_save_ms)
+                (original, decode_ms, orientation_rgb_ms, resize_ms, Some(source_path))
             } else {
                 let stage_start = Instant::now();
                 let original = image::open(&orig_path)
                     .with_context(|| format!("原图丢失: {}", orig_path.display()))?
                     .to_rgb8();
-                (original, stage_start.elapsed().as_millis(), 0, 0, 0)
+                (original, stage_start.elapsed().as_millis(), 0, 0, None)
             };
-        let stage_start = Instant::now();
-        let detection = detect::detect_quad_with_confidence(&original);
-        let detection_ms = stage_start.elapsed().as_millis();
 
-        // 失焦门控：拍完立刻评估清晰度，模糊输入提前暴露
+        // 检测、清晰度评估、预览图、原图归档编码互不依赖（只共享只读的 original），
+        // 在多核端机上并行执行，总耗时≈最慢一项
         let stage_start = Instant::now();
-        let sharpness = quality::laplacian_variance(&original);
-        let quality_ms = stage_start.elapsed().as_millis();
+        let (detect_out, quality_out, preview_out, orig_out) = std::thread::scope(|s| {
+            let h_detect = s.spawn(|| {
+                let t = Instant::now();
+                (detect::detect_quad_with_confidence(&original), t.elapsed().as_millis())
+            });
+            let h_quality = s.spawn(|| {
+                let t = Instant::now();
+                (quality::laplacian_variance(&original), t.elapsed().as_millis())
+            });
+            let h_preview = s.spawn(|| {
+                let t = Instant::now();
+                let preview = shrink(&original, PREVIEW_SIDE);
+                (encode_jpeg(&preview, 82), t.elapsed().as_millis())
+            });
+            let h_orig = archive_source.as_ref().map(|_| {
+                s.spawn(|| {
+                    let t = Instant::now();
+                    (encode_jpeg_photo(&original, JPEG_Q_ORIG), t.elapsed().as_millis())
+                })
+            });
+            (
+                h_detect.join().unwrap(),
+                h_quality.join().unwrap(),
+                h_preview.join().unwrap(),
+                h_orig.map(|h| h.join().unwrap()),
+            )
+        });
+        let (detection, detection_ms) = detect_out;
+        let (sharpness, quality_ms) = quality_out;
+        let (preview_bytes, preview_ms) = preview_out;
+        let parallel_ms = stage_start.elapsed().as_millis();
+        let preview_bytes = preview_bytes.context("预览图编码失败")?;
+        fs::write(self.page_dir(doc_id, page_id).join("preview.jpg"), preview_bytes)
+            .context("写入预览图失败")?;
+        let mut original_save_ms = 0;
+        if let Some((encoded, enc_ms)) = orig_out {
+            let encoded = encoded.context("原图编码失败")?;
+            let write_start = Instant::now();
+            fs::write(&orig_path, encoded)
+                .with_context(|| format!("写入失败: {}", orig_path.display()))?;
+            original_save_ms = enc_ms + write_start.elapsed().as_millis();
+            fs::remove_file(archive_source.as_ref().unwrap())
+                .with_context(|| "删除临时原图失败")?;
+        }
 
         let stage_start = Instant::now();
         let mut doc = self.load_doc(doc_id)?;
@@ -502,12 +582,7 @@ impl Store {
         let metadata_ms = stage_start.elapsed().as_millis();
 
         let stage_start = Instant::now();
-        let preview = shrink(&original, PREVIEW_SIDE);
-        save_jpeg(&preview, &self.page_dir(doc_id, page_id).join("preview.jpg"), 82)?;
-        let preview_ms = stage_start.elapsed().as_millis();
-
-        let stage_start = Instant::now();
-        self.reprocess_with_original(doc_id, page_id, true, Some(original))?;
+        let rt = self.reprocess_with_original(doc_id, page_id, true, Some(original))?;
         let warp_filter_ms = stage_start.elapsed().as_millis();
 
         let mut doc = self.load_doc(doc_id)?;
@@ -532,7 +607,7 @@ impl Store {
             total: total_start.elapsed().as_millis() as u64,
         });
         eprintln!(
-            "[ScanKing timing] process doc={} page={} decode={}ms exif_rgb={}ms resize={}ms original_encode_write={}ms detect={}ms metadata={}ms preview={}ms warp_filter_thumb={}ms total={}ms",
+            "[ScanKing timing] process doc={} page={} decode={}ms exif_rgb={}ms resize={}ms original_encode_write={}ms detect={}ms quality={}ms metadata={}ms preview={}ms parallel={}ms warp_filter_thumb={}ms [warp={} archive={} rotate={} filter={} work_enc={} thumb={}] total={}ms",
             doc_id,
             page_id,
             decode_ms,
@@ -540,9 +615,17 @@ impl Store {
             resize_ms,
             original_save_ms,
             detection_ms,
+            quality_ms,
             metadata_ms,
             preview_ms,
+            parallel_ms,
             warp_filter_ms,
+            rt.warp,
+            rt.archive_encode,
+            rt.rotate,
+            rt.filter,
+            rt.work_encode,
+            rt.thumb,
             total_start.elapsed().as_millis()
         );
         Ok(info)
@@ -560,7 +643,8 @@ impl Store {
 
     /// 重新执行 矫正(可选) → 旋转 → 滤镜 管线
     fn reprocess(&self, doc_id: &str, page_id: &str, rewarp: bool) -> Result<()> {
-        self.reprocess_with_original(doc_id, page_id, rewarp, None)
+        self.reprocess_with_original(doc_id, page_id, rewarp, None)?;
+        Ok(())
     }
 
     fn reprocess_with_original(
@@ -569,7 +653,7 @@ impl Store {
         page_id: &str,
         rewarp: bool,
         original: Option<RgbImage>,
-    ) -> Result<()> {
+    ) -> Result<ReprocessTimings> {
         let doc = self.load_doc(doc_id)?;
         let meta = doc
             .pages
@@ -580,7 +664,13 @@ impl Store {
         let pdir = self.page_dir(doc_id, page_id);
 
         let warped_path = pdir.join("warped.jpg");
-        let warped: RgbImage = if rewarp || !warped_path.exists() {
+        let work_path = pdir.join("work.jpg");
+        let thumb_path = pdir.join("thumb.jpg");
+        let filter_name = Filter::from_name(&meta.filter);
+        let rotation = meta.rotation % 4;
+        let mut timings = ReprocessTimings::default();
+        if rewarp || !warped_path.exists() {
+            let t = Instant::now();
             let orig = match original {
                 Some(image) => image,
                 None => image::open(pdir.join("orig.jpg"))
@@ -594,23 +684,80 @@ impl Store {
                 }
                 None => orig,
             };
-            save_jpeg(&w, &warped_path, JPEG_Q_ORIG)?;
-            w
+            timings.warp = t.elapsed().as_millis();
+            // 原图滤镜且不旋转时，work.jpg 与 warped.jpg 内容完全一致：
+            // 归档改为写完 work.jpg 后直接复制文件，省一次全分辨率 JPEG 编码（~100ms）
+            let reuse_archive = filter_name == Filter::Original && rotation == 0;
+            // warped.jpg 只是磁盘缓存：归档编码与「旋转→滤镜」并行，
+            // 随后 work.jpg 编码与缩略图生成并行
+            let filtered = std::thread::scope(|s| -> Result<RgbImage> {
+                let h_warped = if reuse_archive {
+                    None
+                } else {
+                    Some(s.spawn(|| {
+                        let t = Instant::now();
+                        save_jpeg_photo(&w, &warped_path, JPEG_Q_ORIG)
+                            .map(|_| t.elapsed().as_millis())
+                    }))
+                };
+                let t_rot = Instant::now();
+                let rotated = match rotation {
+                    1 => imageops::rotate90(&w),
+                    2 => imageops::rotate180(&w),
+                    3 => imageops::rotate270(&w),
+                    _ => w.clone(),
+                };
+                timings.rotate = t_rot.elapsed().as_millis();
+                let t_f = Instant::now();
+                let filtered = apply_filter(&rotated, filter_name);
+                timings.filter = t_f.elapsed().as_millis();
+                if let Some(h) = h_warped {
+                    timings.archive_encode = h.join().unwrap()?;
+                }
+                Ok(filtered)
+            })?;
+            let (work_ms, thumb_ms) = std::thread::scope(|s| -> Result<(u128, u128)> {
+                let h_work = s.spawn(|| {
+                    let t = Instant::now();
+                    save_jpeg(&filtered, &work_path, JPEG_Q_WORK).map(|_| t.elapsed().as_millis())
+                });
+                let t = Instant::now();
+                let thumb = shrink(&filtered, THUMB_SIDE);
+                save_jpeg(&thumb, &thumb_path, 78)?;
+                Ok((h_work.join().unwrap()?, t.elapsed().as_millis()))
+            })?;
+            if reuse_archive {
+                fs::copy(&work_path, &warped_path).context("归档缓存复制失败")?;
+            }
+            timings.work_encode = work_ms;
+            timings.thumb = thumb_ms;
         } else {
-            image::open(&warped_path)?.to_rgb8()
-        };
-
-        let rotated = match meta.rotation % 4 {
-            1 => imageops::rotate90(&warped),
-            2 => imageops::rotate180(&warped),
-            3 => imageops::rotate270(&warped),
-            _ => warped,
-        };
-        let filtered = apply_filter(&rotated, Filter::from_name(&meta.filter));
-        save_jpeg(&filtered, &pdir.join("work.jpg"), JPEG_Q_WORK)?;
-        let thumb = shrink(&filtered, THUMB_SIDE);
-        save_jpeg(&thumb, &pdir.join("thumb.jpg"), 78)?;
-        Ok(())
+            let warped = image::open(&warped_path)?.to_rgb8();
+            let t_rot = Instant::now();
+            let rotated = match rotation {
+                1 => imageops::rotate90(&warped),
+                2 => imageops::rotate180(&warped),
+                3 => imageops::rotate270(&warped),
+                _ => warped,
+            };
+            timings.rotate = t_rot.elapsed().as_millis();
+            let t_f = Instant::now();
+            let filtered = apply_filter(&rotated, filter_name);
+            timings.filter = t_f.elapsed().as_millis();
+            let (work_ms, thumb_ms) = std::thread::scope(|s| -> Result<(u128, u128)> {
+                let h_work = s.spawn(|| {
+                    let t = Instant::now();
+                    save_jpeg(&filtered, &work_path, JPEG_Q_WORK).map(|_| t.elapsed().as_millis())
+                });
+                let t = Instant::now();
+                let thumb = shrink(&filtered, THUMB_SIDE);
+                save_jpeg(&thumb, &thumb_path, 78)?;
+                Ok((h_work.join().unwrap()?, t.elapsed().as_millis()))
+            })?;
+            timings.work_encode = work_ms;
+            timings.thumb = thumb_ms;
+        }
+        Ok(timings)
     }
 
     pub fn page_info(&self, doc_id: &str, page_id: &str) -> Result<PageInfo> {
@@ -852,8 +999,9 @@ fn shrink(img: &RgbImage, max_side: u32) -> RgbImage {
         return img.clone();
     }
     let s = max_side as f32 / w.max(h) as f32;
-    imageops::resize(img, (w as f32 * s) as u32, (h as f32 * s) as u32, imageops::FilterType::Triangle)
+    resize_rgb(img, (w as f32 * s) as u32, (h as f32 * s) as u32)
 }
+
 
 /// 简易时间格式（避免引入 chrono）：UTC+8 的 "MMDD-HHMM"
 fn chrono_like(ms: u64) -> String {

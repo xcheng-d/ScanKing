@@ -386,10 +386,19 @@ async function refreshDoc() {
       <span class="pnum">${i + 1}</span>
       ${p.meta.processing ? `<span class="processing-mark">处理中</span>` : ""}
       ${selIdx >= 0 ? `<span class="sel-badge">${selIdx + 1}</span>` : p.meta.ocr_done ? `<span class="ocr-mark">已识别</span>` : ""}`;
+    // 后台处理完成事件会把 currentDoc.pages 里的对象整个替换，
+    // 闭包捕获的 p 是渲染时的旧对象，必须点击时按 id 取实时状态
+    const pageId = p.meta.id;
+    const currentPage = () => currentDoc.pages.find((item) => item.meta.id === pageId) || p;
+    const pageIndex = () => currentDoc.pages.indexOf(currentPage());
     attachPress(
       cell,
-      () => p.meta.processing ? toast("页面仍在处理中，请稍候") : (selectMode ? toggleSelect(p.meta.id) : openPage(i)),
-      () => p.meta.processing ? toast("页面仍在处理中，请稍候") : pageMenu(i)
+      () => currentPage().meta.processing
+        ? toast("页面仍在处理中，请稍候")
+        : (selectMode ? toggleSelect(pageId) : openPage(pageIndex())),
+      () => currentPage().meta.processing
+        ? toast("页面仍在处理中，请稍候")
+        : pageMenu(pageIndex())
     );
     grid.appendChild(cell);
   });

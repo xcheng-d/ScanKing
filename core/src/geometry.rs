@@ -203,6 +203,7 @@ pub fn homography(src: [Pt; 4], dst: [Pt; 4]) -> Option<[f64; 9]> {
 }
 
 #[inline]
+#[allow(dead_code)] // 目前仅测试使用，保留 f64 参考实现
 fn apply_h(h: &[f64; 9], x: f64, y: f64) -> (f64, f64) {
     let w = h[6] * x + h[7] * y + h[8];
     let w = if w.abs() < 1e-12 { 1e-12 } else { w };
@@ -236,21 +237,53 @@ pub fn warp_quad(src: &RgbImage, quad: [Pt; 4]) -> RgbImage {
             * (p2 - p0
                 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)))
     }
+    // 逐像素投影用 f32：坐标量级 ≤6000，精度足够且除法比 f64 快得多
+    let hf: [f32; 9] = std::array::from_fn(|i| hm[i] as f32);
+    let stride = sw as usize * 3;
     out.par_chunks_mut((w * 3) as usize).enumerate().for_each(|(y, row)| {
+        let yf = y as f32;
+        // 单应矩阵里与 x 无关的部分按行预计算
+        let cy0 = hf[1] * yf + hf[2];
+        let cy1 = hf[4] * yf + hf[5];
+        let cy2 = hf[7] * yf + hf[8];
         for x in 0..w as usize {
-            let (sx, sy) = apply_h(&hm, x as f64, y as f64);
-            let x0 = sx.floor() as i64;
-            let y0 = sy.floor() as i64;
-            let fx = (sx - x0 as f64) as f32;
-            let fy = (sy - y0 as f64) as f32;
-            let cx = |dx: i64| (x0 + dx).clamp(0, sw - 1) as usize;
-            let cy = |dy: i64| (y0 + dy).clamp(0, sh - 1) as usize;
+            let xf = x as f32;
+            let mut den = hf[6] * xf + cy2;
+            if den.abs() < 1e-6 {
+                den = 1e-6;
+            }
+            let sx = (hf[0] * xf + cy0) / den;
+            let sy = (hf[3] * xf + cy1) / den;
+            let fx0 = sx.floor();
+            let fy0 = sy.floor();
+            let fx = (sx - fx0).clamp(0.0, 1.0);
+            let fy = (sy - fy0).clamp(0.0, 1.0);
+            let (x0, y0) = (fx0 as i64, fy0 as i64);
+            // 4 个采样列与 4 个采样行的基址只算一次，三通道复用
+            let mut xi = [0usize; 4];
+            let mut rb = [0usize; 4];
+            if x0 >= 1 && x0 <= sw - 3 && y0 >= 1 && y0 <= sh - 3 {
+                // 内部区域：无越界，直接算基址（省掉 8 次 clamp）
+                let xs = (x0 - 1) as usize * 3;
+                let ys = (y0 - 1) as usize * stride;
+                xi = [xs, xs + 3, xs + 6, xs + 9];
+                rb = [ys, ys + stride, ys + 2 * stride, ys + 3 * stride];
+            } else {
+                for (i, d) in (-1i64..=2).enumerate() {
+                    xi[i] = (x0 + d).clamp(0, sw - 1) as usize * 3;
+                    rb[i] = (y0 + d).clamp(0, sh - 1) as usize * stride;
+                }
+            }
             for c in 0..3 {
-                let px = |xx: usize, yy: usize| sbuf[(yy * sw as usize + xx) * 3 + c] as f32;
                 let mut rows = [0.0f32; 4];
-                for (ri, dy) in (-1i64..=2).enumerate() {
-                    let yy = cy(dy);
-                    rows[ri] = cr(px(cx(-1), yy), px(cx(0), yy), px(cx(1), yy), px(cx(2), yy), fx);
+                for (ri, &base) in rb.iter().enumerate() {
+                    rows[ri] = cr(
+                        sbuf[base + xi[0] + c] as f32,
+                        sbuf[base + xi[1] + c] as f32,
+                        sbuf[base + xi[2] + c] as f32,
+                        sbuf[base + xi[3] + c] as f32,
+                        fx,
+                    );
                 }
                 let v = cr(rows[0], rows[1], rows[2], rows[3], fy);
                 row[x * 3 + c] = v.round().clamp(0.0, 255.0) as u8;

@@ -6,6 +6,7 @@ use imageproc::contours::find_contours;
 use imageproc::distance_transform::Norm;
 use imageproc::edges::canny;
 use imageproc::morphology::dilate;
+use rayon::prelude::*;
 
 const DETECT_SIZE: u32 = 600;
 
@@ -28,7 +29,7 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
         ((ow as f32 * scale).round() as u32).max(8),
         ((oh as f32 * scale).round() as u32).max(8),
     );
-    let small = imageops::resize(img, sw, sh, imageops::FilterType::Triangle);
+    let small = crate::resize::resize_rgb(img, sw, sh);
     let gray = imageops::grayscale(&small);
     let blurred = imageproc::filter::gaussian_blur_f32(&gray, 1.4);
 
@@ -131,9 +132,21 @@ type Line = (Pt, Pt); // 直线 = (线上一点, 单位方向)
 /// 沿法线方向做梯度峰值亚像素搜索得到边缘点，各自拟合直线取交点。
 /// 任一条边拟合失败或交点偏离过远时，保留原角点。
 fn refine_quad_subpixel(img: &RgbImage, quad: [Pt; 4]) -> [Pt; 4] {
-    let gray = imageops::grayscale(img);
-    let (w, h) = (gray.width() as i32, gray.height() as i32);
-    let buf = gray.into_raw();
+    // 全分辨率灰度化：单线程 imageops::grayscale 在端机要几十毫秒，改整数权重 + rayon
+    let (iw, ih) = (img.width() as usize, img.height() as usize);
+    let src = img.as_raw();
+    let mut lum = vec![0u8; iw * ih];
+    lum.par_chunks_mut(iw).enumerate().for_each(|(y, row)| {
+        let base = y * iw * 3;
+        for (x, o) in row.iter_mut().enumerate() {
+            let s = base + x * 3;
+            // ITU-R BT.601 权重（与 image::grayscale 一致）
+            *o = ((299 * src[s] as u32 + 587 * src[s + 1] as u32 + 114 * src[s + 2] as u32 + 500)
+                / 1000) as u8;
+        }
+    });
+    let (w, h) = (iw as i32, ih as i32);
+    let buf = lum;
     let grad = |x: f32, y: f32| -> f32 { sobel_mag(&buf, w, h, x, y) };
     // 搜索半径：覆盖缩图 1px 回投误差（7~13px）并留余量
     let diag = (img.width() as f32).hypot(img.height() as f32);

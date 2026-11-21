@@ -65,7 +65,7 @@ impl LowFreq {
         let scale = (small_max as f32 / ow.max(oh) as f32).min(1.0);
         let sw = ((ow as f32 * scale).round() as u32).max(4);
         let sh = ((oh as f32 * scale).round() as u32).max(4);
-        let small = imageops::resize(img, sw, sh, imageops::FilterType::Triangle);
+        let small = crate::resize::resize_rgb(img, sw, sh);
         let mut data = vec![0.0f32; (sw * sh) as usize * channels];
         if channels == 3 {
             let mut buf: ImageBuffer<image::Rgb<f32>, Vec<f32>> = ImageBuffer::new(sw, sh);
@@ -153,8 +153,9 @@ fn enhance(img: &RgbImage) -> RgbImage {
 fn usm_sharpen(img: &RgbImage) -> RgbImage {
     let (w, h) = (img.width(), img.height());
     let long = w.max(h) as f32;
-    // 模糊层分辨率取长边一半：等效 σ = sigma_small/scale ≈ 2px，细节层仍来自全分辨率原图
-    let small_max = ((long * 0.5) as u32).clamp(64, 1600);
+    // 模糊层分辨率取长边 1/4：等效 σ≈2px，细节层仍来自全分辨率原图；
+    // 更低分辨率只损失极低频精度，USM 观感几乎无差，但 resize+高斯开销降到 1/4
+    let small_max = ((long * 0.25) as u32).clamp(64, 800);
     let scale = (small_max as f32 / long).min(1.0);
     let blur = LowFreq::build(img, small_max, (2.0 * scale).max(0.6), 1);
     const K: f32 = 0.7; // 锐化强度
@@ -318,12 +319,14 @@ fn box_mean(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     out
 }
 
-/// 导向滤波去噪（自导向，O(N)、边缘保持）：q = mean(a)·I + mean(b)，
+/// 导向滤波去噪（自导向、边缘保持）：q = mean(a)·I + mean(b)，
 /// 其中 a = var/(var+eps)——平坦区 a→0 平滑掉噪点，边缘区 a→1 保持锐利。
 /// 以 q/L 缩放 RGB 去掉亮度噪声、保住色彩。低光高 ISO 照片受益最明显。
+/// 快速导向滤波：a/b 在 1/2 分辨率上计算后双线性上采样（He et al.），计算量降至 1/4。
 fn guided_denoise(img: &RgbImage) -> RgbImage {
     const RADIUS: usize = 4;
     const EPS: f32 = 180.0; // ≈ 平坦区噪声方差上限，越大平滑越强
+    const SUB: usize = 2; // 下采样倍数
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w == 0 || h == 0 {
         return img.clone();
@@ -333,24 +336,30 @@ fn guided_denoise(img: &RgbImage) -> RgbImage {
     for i in 0..w * h {
         lum[i] = luma_px(src[i * 3] as f32, src[i * 3 + 1] as f32, src[i * 3 + 2] as f32);
     }
-    let mean_i = box_mean(&lum, w, h, RADIUS);
-    let sq: Vec<f32> = lum.iter().map(|v| v * v).collect();
-    let mean_sq = box_mean(&sq, w, h, RADIUS);
-    let mut a = vec![0f32; w * h];
-    let mut b = vec![0f32; w * h];
-    for i in 0..w * h {
+    let (sw, sh) = ((w / SUB).max(1), (h / SUB).max(1));
+    let small = downsample_gray(&lum, w, h, sw, sh);
+    // 以下 4 趟盒式均值都跑在小图上（像素数 1/SUB²）
+    let radius_small = (RADIUS / SUB).max(1);
+    let mean_i = box_mean(&small, sw, sh, radius_small);
+    let sq: Vec<f32> = small.iter().map(|v| v * v).collect();
+    let mean_sq = box_mean(&sq, sw, sh, radius_small);
+    let mut a = vec![0f32; sw * sh];
+    let mut b = vec![0f32; sw * sh];
+    for i in 0..sw * sh {
         let m = mean_i[i];
         let var = (mean_sq[i] - m * m).max(0.0);
         a[i] = var / (var + EPS);
         b[i] = (1.0 - a[i]) * m;
     }
-    let mean_a = box_mean(&a, w, h, RADIUS);
-    let mean_b = box_mean(&b, w, h, RADIUS);
+    let mean_a = box_mean(&a, sw, sh, radius_small);
+    let mean_b = box_mean(&b, sw, sh, radius_small);
+    let a_up = upsample_bilinear(&mean_a, sw, sh, w, h);
+    let b_up = upsample_bilinear(&mean_b, sw, sh, w, h);
     let mut out = vec![0u8; src.len()];
     out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let i = y * w + x;
-            let q = mean_a[i] * lum[i] + mean_b[i];
+            let q = a_up[i] * lum[i] + b_up[i];
             let ratio = (q / lum[i].max(1.0)).clamp(0.7, 1.5);
             for c in 0..3 {
                 row[x * 3 + c] = (src[i * 3 + c] as f32 * ratio).clamp(0.0, 255.0) as u8;
@@ -358,6 +367,56 @@ fn guided_denoise(img: &RgbImage) -> RgbImage {
         }
     });
     RgbImage::from_raw(w as u32, h as u32, out).unwrap()
+}
+
+/// 面积均值降采样（灰度 f32）：每个目标像素取对应源矩形均值（按行并行）
+fn downsample_gray(src: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
+    let mut out = vec![0f32; dw * dh];
+    out.par_chunks_mut(dw).enumerate().for_each(|(dy, row)| {
+        let y0 = dy * h / dh;
+        let y1 = ((dy + 1) * h / dh).max(y0 + 1);
+        for dx in 0..dw {
+            let x0 = dx * w / dw;
+            let x1 = ((dx + 1) * w / dw).max(x0 + 1);
+            let mut s = 0f32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    s += src[y * w + x];
+                }
+            }
+            row[dx] = s / ((y1 - y0) * (x1 - x0)) as f32;
+        }
+    });
+    out
+}
+
+/// 双线性上采样（灰度 f32）：坐标按像素中心对齐，边缘钳制
+fn upsample_bilinear(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<f32> {
+    let mut out = vec![0f32; dw * dh];
+    out.par_chunks_mut(dw)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let gy = (((y as f32 + 0.5) / dh as f32) * sh as f32 - 0.5)
+                .clamp(0.0, (sh - 1) as f32);
+            let y0 = gy.floor() as usize;
+            let y1 = (y0 + 1).min(sh - 1);
+            let wy = gy - y0 as f32;
+            for x in 0..dw {
+                let gx = (((x as f32 + 0.5) / dw as f32) * sw as f32 - 0.5)
+                    .clamp(0.0, (sw - 1) as f32);
+                let x0 = gx.floor() as usize;
+                let x1 = (x0 + 1).min(sw - 1);
+                let wx = gx - x0 as f32;
+                let v00 = src[y0 * sw + x0];
+                let v10 = src[y0 * sw + x1];
+                let v01 = src[y1 * sw + x0];
+                let v11 = src[y1 * sw + x1];
+                let top = v00 + (v10 - v00) * wx;
+                let bot = v01 + (v11 - v01) * wx;
+                row[x] = top + (bot - top) * wy;
+            }
+        });
+    out
 }
 
 /// 黑白文档：Sauvola 局部二值化。

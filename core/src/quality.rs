@@ -3,6 +3,7 @@
 //! 拍完立刻算 Laplacian 方差，低于阈值提示"可能拍糊了，建议重拍"，
 //! 从源头避免模糊输入，比任何事后增强都划算。
 
+use crate::resize::resize_gray;
 use image::{imageops, RgbImage};
 
 /// Laplacian 方差低于该值（0~255 灰度域）判定为可能失焦
@@ -13,16 +14,17 @@ pub const BLURRY_THRESHOLD: f32 = 80.0;
 pub fn laplacian_variance(img: &RgbImage) -> f32 {
     let (w, h) = (img.width(), img.height());
     let long = w.max(h);
+    // 先灰度（全分辨率一次简单转换）再单通道缩放，比先 RGB 缩放省 3 倍采样量
+    let g = imageops::grayscale(img);
     let g = if long > 1200 {
         let s = 1200.0 / long as f32;
-        imageops::grayscale(&imageops::resize(
-            img,
+        resize_gray(
+            &g,
             ((w as f32 * s).round() as u32).max(3),
             ((h as f32 * s).round() as u32).max(3),
-            imageops::FilterType::Triangle,
-        ))
+        )
     } else {
-        imageops::grayscale(img)
+        g
     };
     let (w, h) = (g.width() as usize, g.height() as usize);
     if w < 3 || h < 3 {

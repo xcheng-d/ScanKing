@@ -1,6 +1,7 @@
 //! 增强滤镜：原图 / 增强 / 黑白 / 灰度 / 去阴影
 //! 核心思路：低频背景估计（缩小→高斯模糊→双线性上采样）做光照展平，
 //! 避免全分辨率大半径模糊的内存和耗时。
+//! 增强管线 = 三通道白平衡 → 亮度 CLAHE → 导向滤波去噪 → USM 锐化。
 
 use image::{imageops, GrayImage, ImageBuffer, Luma, RgbImage};
 use rayon::prelude::*;
@@ -118,27 +119,30 @@ impl LowFreq {
     }
 }
 
-/// 增强：基于"亮度"的光照均衡。三个通道乘同一增益，不改变色相与饱和，
-/// 白纸会被提亮、阴影被找平，而证件/彩色内容保持原本色泽。
+/// 增强：三通道光照均衡（去色偏）→ 亮度 CLAHE → 导向滤波去噪 → USM 锐化。
+/// 用 RGB 三通道低频背景分别估计各通道光照，out = in/bg·243（带限幅）：
+/// 发黄老纸、偏色灯光环境自动校正白平衡，字迹/印章颜色因增益限幅得以保留。
 fn enhance(img: &RgbImage) -> RgbImage {
-    let bg = LowFreq::build(img, 360, 24.0, 1);
+    let bg = LowFreq::build(img, 360, 24.0, 3);
     let (w, h) = (img.width(), img.height());
     let src = img.as_raw();
     let mut out = vec![0u8; src.len()];
     out.par_chunks_mut(w as usize * 3).enumerate().for_each(|(y, row)| {
         for x in 0..w as usize {
-            let b = bg.sample(x as u32, y as u32, 0).max(30.0);
-            // 增益限幅：暗背景最多提亮 1.8 倍，避免彩色底被"漂白"
-            let gain = (243.0 / b).clamp(0.90, 1.80);
             for c in 0..3 {
+                let b = bg.sample(x as u32, y as u32, c).max(30.0);
+                // 增益限幅：最多提亮 1.7 倍，避免彩色底被"漂白"或白平衡过度校正
+                let gain = (243.0 / b).clamp(0.90, 1.70);
                 let v = src[(y * w as usize + x) * 3 + c] as f32;
                 let con = (v * gain - 128.0) * 1.05 + 128.0;
                 row[x * 3 + c] = con.clamp(0.0, 255.0) as u8;
             }
         }
     });
-    let filtered = RgbImage::from_raw(w, h, out).unwrap();
-    usm_sharpen(&filtered)
+    let flattened = RgbImage::from_raw(w, h, out).unwrap();
+    let equalized = clahe_luma(&flattened);
+    let denoised = guided_denoise(&equalized);
+    usm_sharpen(&denoised)
 }
 
 /// 自适应 USM 锐化：out = in + k·w·(in − blur)。
@@ -172,6 +176,188 @@ fn usm_sharpen(img: &RgbImage) -> RgbImage {
         }
     });
     RgbImage::from_raw(w, h, out).unwrap()
+}
+
+#[inline]
+fn luma_px(r: f32, g: f32, b: f32) -> f32 {
+    0.299 * r + 0.587 * g + 0.114 * b
+}
+
+/// 亮度通道 tile-based CLAHE（限制对比度自适应直方图均衡），8×8 网格。
+/// 对阴影里文字的局部对比度提升远强于全局分位数拉伸；削顶限制噪声放大。
+/// 通过 L'/L 缩放 RGB，色相饱和度不变；相邻 tile 的 LUT 双线性混合避免块状跳变。
+fn clahe_luma(img: &RgbImage) -> RgbImage {
+    const TILES: usize = 8;
+    const CLIP_K: f32 = 2.8; // 直方图削顶限值 = CLIP_K × 均匀分布
+    const RATIO_MIN: f32 = 0.6;
+    const RATIO_MAX: f32 = 2.5;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < TILES || h < TILES {
+        return img.clone();
+    }
+    let src = img.as_raw();
+    let lum = |i: usize| -> f32 {
+        luma_px(src[i * 3] as f32, src[i * 3 + 1] as f32, src[i * 3 + 2] as f32)
+    };
+    // tile 边界按 w/TILES 均分，保证每个 tile 非空
+    let bound = |t: usize, n: usize| t * n / TILES;
+    let mut luts = vec![[0u8; 256]; TILES * TILES];
+    for ty in 0..TILES {
+        for tx in 0..TILES {
+            let (x0, x1) = (bound(tx, w), bound(tx + 1, w));
+            let (y0, y1) = (bound(ty, h), bound(ty + 1, h));
+            let mut hist = [0u32; 256];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let v = lum(y * w + x).round().clamp(0.0, 255.0) as usize;
+                    hist[v] += 1;
+                }
+            }
+            // 削顶，超出部分均匀摊回所有灰阶
+            let count = ((x1 - x0) * (y1 - y0)) as f32;
+            let clip = ((CLIP_K * count / 256.0) as u32).max(1);
+            let mut excess = 0u32;
+            for c in hist.iter_mut() {
+                if *c > clip {
+                    excess += *c - clip;
+                    *c = clip;
+                }
+            }
+            for c in hist.iter_mut() {
+                *c += excess / 256;
+            }
+            let total: u32 = hist.iter().sum();
+            let lut = &mut luts[ty * TILES + tx];
+            let mut acc = 0u32;
+            for (v, c) in hist.iter().enumerate() {
+                acc += c;
+                lut[v] = (acc as f32 / total as f32 * 255.0).round() as u8;
+            }
+        }
+    }
+    let mut out = vec![0u8; src.len()];
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        let gy = (((y as f32 + 0.5) / h as f32) * TILES as f32 - 0.5)
+            .clamp(0.0, (TILES - 1) as f32);
+        let ty0 = gy.floor() as usize;
+        let ty1 = (ty0 + 1).min(TILES - 1);
+        let wy = gy - ty0 as f32;
+        for x in 0..w {
+            let gx = (((x as f32 + 0.5) / w as f32) * TILES as f32 - 0.5)
+                .clamp(0.0, (TILES - 1) as f32);
+            let tx0 = gx.floor() as usize;
+            let tx1 = (tx0 + 1).min(TILES - 1);
+            let wx = gx - tx0 as f32;
+            let i = y * w + x;
+            let lv = lum(i).round().clamp(0.0, 255.0) as usize;
+            let v00 = luts[ty0 * TILES + tx0][lv] as f32;
+            let v10 = luts[ty0 * TILES + tx1][lv] as f32;
+            let v01 = luts[ty1 * TILES + tx0][lv] as f32;
+            let v11 = luts[ty1 * TILES + tx1][lv] as f32;
+            let top = v00 + (v10 - v00) * wx;
+            let bot = v01 + (v11 - v01) * wx;
+            let l2 = top + (bot - top) * wy;
+            let ratio = (l2 / lum(i).max(1.0)).clamp(RATIO_MIN, RATIO_MAX);
+            for c in 0..3 {
+                row[x * 3 + c] = (src[i * 3 + c] as f32 * ratio).clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+    RgbImage::from_raw(w as u32, h as u32, out).unwrap()
+}
+
+/// 滑动窗口盒式均值：O(N) 时间、O(w) 额外内存（无积分图大内存开销），
+/// 边界按实际窗口大小校正（等效边缘复制填充）
+fn box_mean(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut out = vec![0f32; w * h];
+    if w == 0 || h == 0 {
+        return out;
+    }
+    let mut col = vec![0f64; w];
+    for y in 0..=r.min(h - 1) {
+        for (x, &v) in src[y * w..(y + 1) * w].iter().enumerate() {
+            col[x] += v as f64;
+        }
+    }
+    for y in 0..h {
+        if y > 0 {
+            if y + r <= h - 1 {
+                for (x, &v) in src[(y + r) * w..(y + r + 1) * w].iter().enumerate() {
+                    col[x] += v as f64;
+                }
+            }
+            if y >= r + 1 {
+                for (x, &v) in src[(y - r - 1) * w..(y - r) * w].iter().enumerate() {
+                    col[x] -= v as f64;
+                }
+            }
+        }
+        let ylo = y.saturating_sub(r);
+        let yhi = (y + r).min(h - 1);
+        let ycnt = (yhi - ylo + 1) as f64;
+        let mut hsum = 0f64;
+        for x in 0..=r.min(w - 1) {
+            hsum += col[x];
+        }
+        let out_row = &mut out[y * w..(y + 1) * w];
+        for x in 0..w {
+            if x > 0 {
+                if x + r <= w - 1 {
+                    hsum += col[x + r];
+                }
+                if x >= r + 1 {
+                    hsum -= col[x - r - 1];
+                }
+            }
+            let xlo = x.saturating_sub(r);
+            let xhi = (x + r).min(w - 1);
+            let cnt = ycnt * ((xhi - xlo + 1) as f64);
+            out_row[x] = (hsum / cnt) as f32;
+        }
+    }
+    out
+}
+
+/// 导向滤波去噪（自导向，O(N)、边缘保持）：q = mean(a)·I + mean(b)，
+/// 其中 a = var/(var+eps)——平坦区 a→0 平滑掉噪点，边缘区 a→1 保持锐利。
+/// 以 q/L 缩放 RGB 去掉亮度噪声、保住色彩。低光高 ISO 照片受益最明显。
+fn guided_denoise(img: &RgbImage) -> RgbImage {
+    const RADIUS: usize = 4;
+    const EPS: f32 = 180.0; // ≈ 平坦区噪声方差上限，越大平滑越强
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return img.clone();
+    }
+    let src = img.as_raw();
+    let mut lum = vec![0f32; w * h];
+    for i in 0..w * h {
+        lum[i] = luma_px(src[i * 3] as f32, src[i * 3 + 1] as f32, src[i * 3 + 2] as f32);
+    }
+    let mean_i = box_mean(&lum, w, h, RADIUS);
+    let sq: Vec<f32> = lum.iter().map(|v| v * v).collect();
+    let mean_sq = box_mean(&sq, w, h, RADIUS);
+    let mut a = vec![0f32; w * h];
+    let mut b = vec![0f32; w * h];
+    for i in 0..w * h {
+        let m = mean_i[i];
+        let var = (mean_sq[i] - m * m).max(0.0);
+        a[i] = var / (var + EPS);
+        b[i] = (1.0 - a[i]) * m;
+    }
+    let mean_a = box_mean(&a, w, h, RADIUS);
+    let mean_b = box_mean(&b, w, h, RADIUS);
+    let mut out = vec![0u8; src.len()];
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let i = y * w + x;
+            let q = mean_a[i] * lum[i] + mean_b[i];
+            let ratio = (q / lum[i].max(1.0)).clamp(0.7, 1.5);
+            for c in 0..3 {
+                row[x * 3 + c] = (src[i * 3 + c] as f32 * ratio).clamp(0.0, 255.0) as u8;
+            }
+        }
+    });
+    RgbImage::from_raw(w as u32, h as u32, out).unwrap()
 }
 
 /// 黑白文档：Sauvola 局部二值化。

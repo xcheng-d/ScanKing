@@ -44,9 +44,11 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
     }
 
     let (quad, confidence) = match best {
-        Some(q) => {
+        Some(cand) => {
+            // 真实置信度：矩形度 + 边缘支持率 + 面积占比（在缩图坐标上评估）
+            let conf = confidence_score(&blurred, &cand, sw, sh);
             let inv = 1.0 / scale;
-            let mut out = q;
+            let mut out = cand.quad;
             for p in out.iter_mut() {
                 p[0] = (p[0] * inv).clamp(0.0, ow as f32 - 1.0);
                 p[1] = (p[1] * inv).clamp(0.0, oh as f32 - 1.0);
@@ -54,11 +56,73 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
             // 600px 缩图上的角点回投 4000px 原图误差可达 7~13px，
             // 在原图分辨率上做边缘直线拟合取交点，精化到亚像素级
             let refined = refine_quad_subpixel(img, out);
-            (refined, 1.0)
+            (refined, conf)
         }
         None => (full_quad(ow, oh), 0.0),
     };
     QuadDetection { quad, confidence }
+}
+
+/// 轮廓候选：四边形 + 用于置信度评估的面积信息
+struct QuadCandidate {
+    quad: [Pt; 4],
+    hull_area: f32,
+    quad_area: f32,
+}
+
+/// 边缘支持率判定的梯度阈值（0~255 Sobel 幅值）
+const EDGE_GRAD_MIN: f32 = 22.0;
+
+/// 合成置信度 ∈ [0,1]：
+/// - 矩形度（0.45）：quad_area/hull_area，四边形贴合轮廓凸包的程度
+/// - 边缘支持率（0.40）：四边采样点处梯度超过阈值的比例，虚检边框此项极低
+/// - 面积占比（0.15）：过小不像文档，≈整图说明匹配到图像外框
+/// 前端据 confidence < 0.45 提示"请手动调整裁剪框"
+fn confidence_score(blurred: &GrayImage, cand: &QuadCandidate, sw: u32, sh: u32) -> f32 {
+    let rect = (cand.quad_area / cand.hull_area.max(1.0)).clamp(0.0, 1.0);
+    let area_ratio = cand.quad_area / ((sw * sh) as f32);
+    let area_score = if area_ratio < 0.12 {
+        area_ratio / 0.12
+    } else if area_ratio <= 0.95 {
+        1.0
+    } else {
+        ((1.0 - area_ratio) / 0.05).clamp(0.0, 1.0)
+    };
+    let edge = edge_support_ratio(blurred, &cand.quad);
+    (0.45 * rect + 0.40 * edge + 0.15 * area_score).clamp(0.0, 1.0)
+}
+
+/// 四边各采样 10 点（避开角点），统计 Sobel 梯度达标比例
+fn edge_support_ratio(gray: &GrayImage, quad: &[Pt; 4]) -> f32 {
+    let (w, h) = (gray.width() as i32, gray.height() as i32);
+    let buf = gray.as_raw();
+    let mut supported = 0usize;
+    let mut total = 0usize;
+    for e in 0..4 {
+        let (a, b) = (quad[e], quad[(e + 1) % 4]);
+        for k in 0..10usize {
+            let t = 0.1 + 0.08 * k as f32; // 0.1..0.82
+            let x = a[0] + (b[0] - a[0]) * t;
+            let y = a[1] + (b[1] - a[1]) * t;
+            total += 1;
+            if sobel_mag(buf, w, h, x, y) >= EDGE_GRAD_MIN {
+                supported += 1;
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { supported as f32 / total as f32 }
+}
+
+/// 采样点处的 Sobel 梯度幅值（越界坐标钳制到图内）
+fn sobel_mag(buf: &[u8], w: i32, h: i32, x: f32, y: f32) -> f32 {
+    let cx = |v: f32| (v.round() as i32).clamp(0, w - 1) as usize;
+    let cy = |v: f32| (v.round() as i32).clamp(0, h - 1) as usize;
+    let at = |xx: f32, yy: f32| buf[cy(yy) * w as usize + cx(xx)] as f32;
+    let gx = at(x + 1.0, y - 1.0) + 2.0 * at(x + 1.0, y) + at(x + 1.0, y + 1.0)
+        - at(x - 1.0, y - 1.0) - 2.0 * at(x - 1.0, y) - at(x - 1.0, y + 1.0);
+    let gy = at(x - 1.0, y + 1.0) + 2.0 * at(x, y + 1.0) + at(x + 1.0, y + 1.0)
+        - at(x - 1.0, y - 1.0) - 2.0 * at(x, y - 1.0) - at(x + 1.0, y - 1.0);
+    (gx * gx + gy * gy).sqrt()
 }
 
 type Line = (Pt, Pt); // 直线 = (线上一点, 单位方向)
@@ -70,16 +134,7 @@ fn refine_quad_subpixel(img: &RgbImage, quad: [Pt; 4]) -> [Pt; 4] {
     let gray = imageops::grayscale(img);
     let (w, h) = (gray.width() as i32, gray.height() as i32);
     let buf = gray.into_raw();
-    let grad = move |x: f32, y: f32| -> f32 {
-        let cx = |v: f32| (v.round() as i32).clamp(0, w - 1) as usize;
-        let cy = |v: f32| (v.round() as i32).clamp(0, h - 1) as usize;
-        let at = |xx: f32, yy: f32| buf[cy(yy) * w as usize + cx(xx)] as f32;
-        let gx = at(x + 1.0, y - 1.0) + 2.0 * at(x + 1.0, y) + at(x + 1.0, y + 1.0)
-            - at(x - 1.0, y - 1.0) - 2.0 * at(x - 1.0, y) - at(x - 1.0, y + 1.0);
-        let gy = at(x - 1.0, y + 1.0) + 2.0 * at(x, y + 1.0) + at(x + 1.0, y + 1.0)
-            - at(x - 1.0, y - 1.0) - 2.0 * at(x, y - 1.0) - at(x + 1.0, y - 1.0);
-        (gx * gx + gy * gy).sqrt()
-    };
+    let grad = |x: f32, y: f32| -> f32 { sobel_mag(&buf, w, h, x, y) };
     // 搜索半径：覆盖缩图 1px 回投误差（7~13px）并留余量
     let diag = (img.width() as f32).hypot(img.height() as f32);
     let search = (diag * 0.006).clamp(8.0, 24.0);
@@ -184,10 +239,10 @@ pub fn full_quad(w: u32, h: u32) -> [Pt; 4] {
     ]
 }
 
-fn try_contours(edges: &GrayImage, sw: u32, sh: u32) -> Option<[Pt; 4]> {
+fn try_contours(edges: &GrayImage, sw: u32, sh: u32) -> Option<QuadCandidate> {
     let img_area = (sw * sh) as f32;
     let contours = find_contours::<i32>(edges);
-    let mut best: Option<([Pt; 4], f32)> = None;
+    let mut best: Option<QuadCandidate> = None;
     for c in &contours {
         if c.points.len() < 8 {
             continue;
@@ -217,12 +272,12 @@ fn try_contours(edges: &GrayImage, sw: u32, sh: u32) -> Option<[Pt; 4]> {
         if qa < img_area * 0.10 {
             continue;
         }
-        match best {
-            Some((_, a)) if a >= qa => {}
-            _ => best = Some((quad, qa)),
+        match &best {
+            Some(b) if b.quad_area >= qa => {}
+            _ => best = Some(QuadCandidate { quad, hull_area, quad_area: qa }),
         }
     }
-    best.map(|(quad, _)| quad)
+    best
 }
 
 fn median(g: &GrayImage) -> u8 {

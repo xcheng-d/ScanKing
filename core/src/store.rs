@@ -87,7 +87,8 @@ pub struct PageInfo {
     pub quad: [[f32; 2]; 4],
     /// preview 相对原图的缩放比
     pub preview_scale: f32,
-    /// 自动边框检测状态：1 表示找到候选边框，0 表示回退到整图
+    /// 自动边框检测置信度 ∈ [0,1]：矩形度+边缘支持率+面积占比合成；
+    /// 0 表示未检测到、回退到整图。低于 0.45 时前端提示手动检查四角
     pub detection_confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_timings_ms: Option<PageSaveTimings>,

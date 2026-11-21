@@ -104,7 +104,9 @@ fn test_pending_import_finishes_in_background_stage() {
 
     let completed = store.process_pending_page(&doc.id, &pending.meta.id).unwrap();
     assert!(!completed.meta.processing);
-    assert_eq!(completed.detection_confidence, Some(1.0));
+    // 合成文档边框清晰，真实置信度应明显高于"提示手动检查"的 0.45 门槛
+    let conf = completed.detection_confidence.expect("应有检测置信度");
+    assert!(conf > 0.5, "清晰文档检测置信度过低: {conf}");
     assert_ne!(completed.thumb, completed.work);
     assert!(std::path::Path::new(&completed.preview).exists());
     assert!(std::path::Path::new(&completed.thumb).exists());

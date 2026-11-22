@@ -45,27 +45,25 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
     let edges_strict = dilate(&canny(&blurred, lo, hi), Norm::LInf, 1);
     let edges_loose = dilate(&canny(&blurred, lo * 0.5, hi * 0.5), Norm::LInf, 2);
     let mut candidates: Vec<QuadCandidate> = Vec::new();
-    if let Some(c) = try_contours(&edges_strict, sw, sh) {
+    if let Some(c) = try_contours(&edges_strict, &blurred, &diff, sw, sh) {
         candidates.push(c);
     }
-    if let Some(c) = try_contours(&edges_loose, sw, sh) {
+    if let Some(c) = try_contours(&edges_loose, &blurred, &diff, sw, sh) {
         candidates.push(c);
     }
     let conf_of = |c: &QuadCandidate| confidence_score(&blurred, &diff, c, sw, sh);
     let quick_conf = candidates.iter().map(&conf_of).fold(0.0f32, f32::max);
     // 分位数阈值 + 成片中等色差判据，避免被文字极值拉偏
     let (diff_t, has_color_region) = color_threshold(&diff);
-    let mut color_signal = false;
-
     // 灰度路径失败/置信不足，或确实存在成片淡色纸张时，启用
     // 梯度分位数自适应 / 色差边缘合并 / 色差区域分割 三条补充路径。
     // 后者不能省略：低对比度图里错误框也可能拿到较高置信度，色差分割才是最可靠证据
     if quick_conf < 0.7 || has_color_region {
-        color_signal = has_color_region;
+        let color_signal = has_color_region;
 
         let (glo, ghi) = gradient_thresholds(&blurred);
         let edges_grad = dilate(&canny(&blurred, glo, ghi), Norm::LInf, 1);
-        if let Some(c) = try_contours(&edges_grad, sw, sh) {
+        if let Some(c) = try_contours(&edges_grad, &blurred, &diff, sw, sh) {
             candidates.push(c);
         }
         if color_signal {
@@ -77,7 +75,7 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
                 .map(|(&a, &b)| a.max(b))
                 .collect();
             let edges_combined = GrayImage::from_raw(sw, sh, combined_buf).unwrap();
-            if let Some(c) = try_contours(&edges_combined, sw, sh) {
+            if let Some(c) = try_contours(&edges_combined, &blurred, &diff, sw, sh) {
                 candidates.push(c);
             }
             let mask: Vec<u8> = diff
@@ -86,7 +84,7 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
                 .map(|&v| if v >= diff_t { 255 } else { 0 })
                 .collect();
             let mask = GrayImage::from_raw(sw, sh, mask).unwrap();
-            if let Some(c) = try_contours(&mask, sw, sh) {
+            if let Some(c) = try_contours(&mask, &blurred, &diff, sw, sh) {
                 candidates.push(c);
             }
         }
@@ -111,7 +109,9 @@ pub fn detect_quad_with_confidence(img: &RgbImage) -> QuadDetection {
             // 600px 缩图上的角点回投 4000px 原图误差可达 7~13px，
             // 在原图分辨率上做边缘直线拟合取交点，精化到亚像素级；
             // 低对比度彩色纸张用全分辨率色差图提供梯度
-            let full_diff = color_signal.then(|| color_diff_map(img, bg));
+            // Always provide full-resolution color contrast for the final edge refinement.
+            // The grayscale gradient remains the primary signal; color difference is additive.
+            let full_diff = Some(color_diff_map(img, bg));
             let mut refined = refine_quad_subpixel(img, out, full_diff.as_ref());
             // 直线拟合交点可能落到图外（透视纸张出画时），钳回图像范围内
             for p in refined.iter_mut() {
@@ -147,17 +147,27 @@ fn confidence_score(
     sw: u32,
     sh: u32,
 ) -> f32 {
+    if !quad_is_convex(&cand.quad) {
+        return 0.0;
+    }
     let rect = (cand.quad_area / cand.hull_area.max(1.0)).clamp(0.0, 1.0);
     let area_ratio = cand.quad_area / ((sw * sh) as f32);
     let area_score = if area_ratio < 0.12 {
         area_ratio / 0.12
-    } else if area_ratio <= 0.95 {
+    } else if area_ratio <= 0.82 {
         1.0
+    } else if area_ratio <= 0.95 {
+        (0.95 - area_ratio) / 0.13
     } else {
         ((1.0 - area_ratio) / 0.05).clamp(0.0, 1.0)
     };
     let edge = edge_support_ratio(blurred, diff, &cand.quad);
-    (0.45 * rect + 0.40 * edge + 0.15 * area_score).clamp(0.0, 1.0)
+    let border = border_margin_score(&cand.quad, sw, sh);
+    let contrast = edge_side_contrast(blurred, diff, &cand.quad);
+    (0.30 * rect + 0.25 * edge + 0.15 * area_score
+        + 0.15 * border
+        + 0.15 * contrast)
+        .clamp(0.0, 1.0)
 }
 
 /// 四边各采样 10 点（避开角点），统计灰度/色差图上 Sobel 梯度达标比例。
@@ -183,6 +193,80 @@ fn edge_support_ratio(gray: &GrayImage, diff: &GrayImage, quad: &[Pt; 4]) -> f32
         }
     }
     if total == 0 { 0.0 } else { supported as f32 / total as f32 }
+}
+
+fn quad_is_convex(quad: &[Pt; 4]) -> bool {
+    let mut sign = 0i32;
+    for i in 0..4 {
+        let a = quad[i];
+        let b = quad[(i + 1) % 4];
+        let c = quad[(i + 2) % 4];
+        let cross = (b[0] - a[0]) * (c[1] - b[1])
+            - (b[1] - a[1]) * (c[0] - b[0]);
+        let s = if cross > 0.0 { 1 } else if cross < 0.0 { -1 } else { 0 };
+        if s != 0 {
+            if sign != 0 && s != sign {
+                return false;
+            }
+            sign = s;
+        }
+    }
+    sign != 0
+}
+
+/// Prefer candidates separated from the image frame. This suppresses a full-photo
+/// or desk/table outer contour when a smaller document contour is available.
+fn border_margin_score(quad: &[Pt; 4], sw: u32, sh: u32) -> f32 {
+    let margin = (sw.min(sh) as f32 * 0.05).max(4.0);
+    let mut min_normalized = f32::MAX;
+    for p in quad {
+        let d = p[0].min(p[1]).min(sw as f32 - 1.0 - p[0])
+            .min(sh as f32 - 1.0 - p[1])
+            .max(0.0);
+        min_normalized = min_normalized.min(d / margin);
+    }
+    min_normalized.clamp(0.0, 1.0)
+}
+
+/// Compare inside/outside intensity and color on both sides of each edge.
+/// A real document edge generally has stronger consistent contrast than texture or text.
+fn edge_side_contrast(gray: &GrayImage, diff: &GrayImage, quad: &[Pt; 4]) -> f32 {
+    let w = gray.width() as i32;
+    let h = gray.height() as i32;
+    let at = |buf: &[u8], x: i32, y: i32| -> f32 {
+        let x = x.clamp(0, w - 1) as usize;
+        let y = y.clamp(0, h - 1) as usize;
+        buf[y * w as usize + x] as f32
+    };
+    let mut contrast = 0.0f32;
+    let mut count = 0usize;
+    for e in 0..4 {
+        let a = quad[e];
+        let b = quad[(e + 1) % 4];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let len = dx.hypot(dy);
+        if len < 4.0 {
+            continue;
+        }
+        let nx = -dy / len;
+        let ny = dx / len;
+        for k in 1..=8usize {
+            let t = k as f32 / 9.0;
+            let x = a[0] + dx * t;
+            let y = a[1] + dy * t;
+            let offset = (len * 0.012).clamp(2.0, 10.0);
+            let ix = (x + nx * offset).round() as i32;
+            let iy = (y + ny * offset).round() as i32;
+            let ox = (x - nx * offset).round() as i32;
+            let oy = (y - ny * offset).round() as i32;
+            let gray_d = (at(gray.as_raw(), ix, iy) - at(gray.as_raw(), ox, oy)).abs();
+            let diff_d = (at(diff.as_raw(), ix, iy) - at(diff.as_raw(), ox, oy)).abs();
+            contrast += (gray_d.max(diff_d) / 64.0).clamp(0.0, 1.0);
+            count += 1;
+        }
+    }
+    if count == 0 { 0.0 } else { contrast / count as f32 }
 }
 
 /// 采样点处的 Sobel 梯度幅值（越界坐标钳制到图内）
@@ -335,7 +419,13 @@ pub fn full_quad(w: u32, h: u32) -> [Pt; 4] {
     ]
 }
 
-fn try_contours(edges: &GrayImage, sw: u32, sh: u32) -> Option<QuadCandidate> {
+fn try_contours(
+    edges: &GrayImage,
+    gray: &GrayImage,
+    diff: &GrayImage,
+    sw: u32,
+    sh: u32,
+) -> Option<QuadCandidate> {
     let img_area = (sw * sh) as f32;
     let contours = find_contours::<i32>(edges);
     let mut best: Option<QuadCandidate> = None;
@@ -368,9 +458,12 @@ fn try_contours(edges: &GrayImage, sw: u32, sh: u32) -> Option<QuadCandidate> {
         if qa < img_area * 0.10 {
             continue;
         }
+        let candidate = QuadCandidate { quad, hull_area, quad_area: qa };
         match &best {
-            Some(b) if b.quad_area >= qa => {}
-            _ => best = Some(QuadCandidate { quad, hull_area, quad_area: qa }),
+            Some(b)
+                if confidence_score(gray, diff, b, sw, sh)
+                    >= confidence_score(gray, diff, &candidate, sw, sh) => {}
+            _ => best = Some(candidate),
         }
     }
     best

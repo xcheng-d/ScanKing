@@ -78,6 +78,51 @@ fn test_detect_quad_accuracy() {
 }
 
 #[test]
+fn test_detect_quad_prefers_document_over_full_frame() {
+    let (w, h) = (600u32, 800u32);
+    let mut img = RgbImage::from_pixel(w, h, Rgb([72, 74, 78]));
+    let outer = [[20.0f32, 20.0], [580.0, 20.0], [580.0, 780.0], [20.0, 780.0]];
+    let inner = [[150.0f32, 180.0], [470.0, 160.0], [500.0, 640.0], [130.0, 660.0]];
+    for y in 0..h {
+        for x in 0..w {
+            let inside = |quad: &[[f32; 2]; 4]| {
+                let mut sign = 0i32;
+                for i in 0..4 {
+                    let a = quad[i];
+                    let b = quad[(i + 1) % 4];
+                    let c = (b[0] - a[0]) * (y as f32 - a[1])
+                        - (b[1] - a[1]) * (x as f32 - a[0]);
+                    let s = if c >= 0.0 { 1 } else { -1 };
+                    if sign == 0 { sign = s; } else if s != sign { return false; }
+                }
+                true
+            };
+            if inside(&outer) {
+                img.put_pixel(x, y, Rgb([95, 97, 100]));
+            }
+            if inside(&inner) {
+                img.put_pixel(x, y, Rgb([238, 238, 232]));
+            }
+        }
+    }
+
+    let detection = scanking_core::detect::detect_quad_with_confidence(&img);
+    let detected = order_quad(detection.quad);
+    let truth = order_quad(inner);
+    for i in 0..4 {
+        let d = dist(detected[i], truth[i]);
+        assert!(
+            d < 35.0,
+            "内页角点 {} 误选外框或背景: {:?} vs {:?} (d={})",
+            i,
+            detected[i],
+            truth[i],
+            d
+        );
+    }
+}
+
+#[test]
 fn test_pending_import_finishes_in_background_stage() {
     let root = std::env::temp_dir().join(format!("sk_pending_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
